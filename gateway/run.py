@@ -345,7 +345,7 @@ def _build_completion_reminder_command(
     response_preview: str,
     now: Optional[datetime] = None,
 ) -> List[str]:
-    due_at = (now or datetime.now()) + timedelta(seconds=10)
+    due_at = now or datetime.now()
     due = due_at.strftime("%Y-%m-%d %H:%M:%S")
     duration = _format_duration(elapsed_seconds)
     title = f"Goku finished your WhatsApp task ({duration})"

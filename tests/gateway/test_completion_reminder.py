@@ -15,7 +15,7 @@ def test_completion_reminder_threshold_zero_means_every_reply(monkeypatch):
     assert run._completion_reminder_threshold_seconds() == 0
 
 
-def test_completion_reminder_command_targets_near_future_seconds():
+def test_completion_reminder_command_targets_current_second():
     command = run._build_completion_reminder_command(
         elapsed_seconds=125,
         api_calls=7,
@@ -29,6 +29,6 @@ def test_completion_reminder_command_targets_near_future_seconds():
     assert "Goku finished your WhatsApp task (2m 5s)" in command
     assert "--no-input" in command
     assert "--json" in command
-    assert command[command.index("--due") + 1] == "2026-05-10 12:34:30"
-    assert command[command.index("--alarm") + 1] == "2026-05-10 12:34:30"
+    assert command[command.index("--due") + 1] == "2026-05-10 12:34:20"
+    assert command[command.index("--alarm") + 1] == "2026-05-10 12:34:20"
     assert "The WhatsApp reply has been delivered." in command[command.index("--notes") + 1]
