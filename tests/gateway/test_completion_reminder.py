@@ -24,9 +24,11 @@ def test_completion_reminder_command_targets_next_minute():
         now=datetime(2026, 5, 10, 12, 34, 20),
     )
 
-    assert command[:3] == ["remindctl", "add", "--title"]
+    assert command[0].endswith("remindctl")
+    assert command[1:3] == ["add", "--title"]
     assert "Goku finished your WhatsApp task (2m 5s)" in command
     assert "--no-input" in command
+    assert "--json" in command
     assert command[command.index("--due") + 1] == "2026-05-10 12:35"
     assert command[command.index("--alarm") + 1] == "2026-05-10 12:35"
     assert "The WhatsApp reply has been delivered." in command[command.index("--notes") + 1]

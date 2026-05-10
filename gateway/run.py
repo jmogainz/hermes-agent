@@ -304,6 +304,7 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 
 _COMPLETION_REMINDER_ENV = "HERMES_COMPLETION_REMINDER_MIN_SECONDS"
 _COMPLETION_REMINDER_PLATFORM = "whatsapp"
+_REMINDCTL_FALLBACK_PATH = "/opt/homebrew/bin/remindctl"
 
 
 def _truncate_for_reminder(value: Any, *, limit: int = 240) -> str:
@@ -359,8 +360,9 @@ def _build_completion_reminder_command(
     response = _truncate_for_reminder(response_preview)
     if response:
         notes_parts.append(f"Reply: {response}")
+    remindctl_path = shutil.which("remindctl") or _REMINDCTL_FALLBACK_PATH
     return [
-        "remindctl",
+        remindctl_path,
         "add",
         "--title",
         title,
@@ -371,6 +373,7 @@ def _build_completion_reminder_command(
         "--alarm",
         due,
         "--no-input",
+        "--json",
     ]
 
 
@@ -387,7 +390,7 @@ def _send_completion_reminder(
         return False
     if str(platform_name or "").lower() != _COMPLETION_REMINDER_PLATFORM:
         return False
-    if shutil.which("remindctl") is None:
+    if shutil.which("remindctl") is None and not Path(_REMINDCTL_FALLBACK_PATH).exists():
         logger.warning("Completion reminder skipped: remindctl is not installed")
         return False
 
@@ -397,25 +400,41 @@ def _send_completion_reminder(
         message_preview=message_preview,
         response_preview=response_preview,
     )
+
+    def _run_reminder_command() -> None:
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception as exc:
+            logger.warning("Completion reminder failed: %s", exc)
+            return
+        if result.returncode != 0:
+            logger.warning(
+                "Completion reminder failed with exit %s: %s",
+                result.returncode,
+                (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        logger.info("Completion reminder created for WhatsApp task after %.1fs", elapsed_seconds)
+
     try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        threading.Thread(
+            target=_run_reminder_command,
+            name="completion-reminder",
+            daemon=True,
+        ).start()
     except Exception as exc:
-        logger.warning("Completion reminder failed: %s", exc)
+        logger.warning("Completion reminder thread failed to start: %s", exc)
         return False
-    if result.returncode != 0:
-        logger.warning(
-            "Completion reminder failed with exit %s: %s",
-            result.returncode,
-            (result.stderr or result.stdout or "").strip(),
-        )
-        return False
-    logger.info("Completion reminder created for WhatsApp task after %.1fs", elapsed_seconds)
+    logger.info(
+        "Completion reminder queued for WhatsApp task after %.1fs",
+        elapsed_seconds,
+    )
     return True
 
 # ---------------------------------------------------------------------------
