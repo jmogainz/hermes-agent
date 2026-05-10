@@ -93,6 +93,8 @@ Accepted by `--due` and date filters:
 
 ## Rules
 
-1. When user says "remind me", clarify: Apple Reminders (syncs to phone) vs agent cronjob alert
-2. Always confirm reminder content and due date before creating
-3. Use `--json` for programmatic parsing
+1. For Jacob's personal "remind me" / "reminder to myself" requests, default to Apple Reminders because it syncs to Jacob's iPhone through iCloud.
+2. Clarify only when the request sounds like an agent-internal scheduled job/report rather than a user-facing reminder.
+3. Always confirm reminder content and due date before creating unless Jacob gives an explicit complete command with title and time.
+4. Use the default `Reminders` list unless Jacob names another Reminders list.
+5. Use `--json` for programmatic parsing.
