@@ -31,16 +31,18 @@ import json
 import logging
 import os
 import re
+import shutil
 import shlex
 import sys
 import signal
+import subprocess
 import tempfile
 import threading
 import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -300,6 +302,122 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+_COMPLETION_REMINDER_ENV = "HERMES_COMPLETION_REMINDER_MIN_SECONDS"
+_COMPLETION_REMINDER_PLATFORM = "whatsapp"
+
+
+def _truncate_for_reminder(value: Any, *, limit: int = 240) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _completion_reminder_threshold_seconds() -> Optional[float]:
+    raw = os.getenv(_COMPLETION_REMINDER_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        threshold = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; completion reminders disabled", _COMPLETION_REMINDER_ENV, raw)
+        return None
+    if threshold <= 0:
+        return None
+    return threshold
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    minutes, rem = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {rem}s"
+    return f"{rem}s"
+
+
+def _build_completion_reminder_command(
+    *,
+    elapsed_seconds: float,
+    api_calls: int,
+    message_preview: str,
+    response_preview: str,
+    now: Optional[datetime] = None,
+) -> List[str]:
+    due_at = (now or datetime.now()) + timedelta(minutes=1)
+    due = due_at.strftime("%Y-%m-%d %H:%M")
+    duration = _format_duration(elapsed_seconds)
+    title = f"Goku finished your WhatsApp task ({duration})"
+    notes_parts = [
+        "The WhatsApp reply has been delivered.",
+        f"Runtime: {duration}",
+        f"API calls: {api_calls}",
+    ]
+    request = _truncate_for_reminder(message_preview)
+    if request:
+        notes_parts.append(f"Request: {request}")
+    response = _truncate_for_reminder(response_preview)
+    if response:
+        notes_parts.append(f"Reply: {response}")
+    return [
+        "remindctl",
+        "add",
+        "--title",
+        title,
+        "--notes",
+        "\n".join(notes_parts),
+        "--due",
+        due,
+        "--alarm",
+        due,
+        "--no-input",
+    ]
+
+
+def _send_completion_reminder(
+    *,
+    platform_name: str,
+    elapsed_seconds: float,
+    api_calls: int,
+    message_preview: str,
+    response_preview: str,
+) -> bool:
+    threshold = _completion_reminder_threshold_seconds()
+    if threshold is None or elapsed_seconds < threshold:
+        return False
+    if str(platform_name or "").lower() != _COMPLETION_REMINDER_PLATFORM:
+        return False
+    if shutil.which("remindctl") is None:
+        logger.warning("Completion reminder skipped: remindctl is not installed")
+        return False
+
+    command = _build_completion_reminder_command(
+        elapsed_seconds=elapsed_seconds,
+        api_calls=api_calls,
+        message_preview=message_preview,
+        response_preview=response_preview,
+    )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("Completion reminder failed: %s", exc)
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "Completion reminder failed with exit %s: %s",
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    logger.info("Completion reminder created for WhatsApp task after %.1fs", elapsed_seconds)
+    return True
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -541,6 +659,10 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "completion_reminder_min_seconds" in _agent_cfg:
+                os.environ["HERMES_COMPLETION_REMINDER_MIN_SECONDS"] = str(
+                    _agent_cfg["completion_reminder_min_seconds"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -7941,6 +8063,68 @@ class GatewayRunner:
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+            try:
+                _completion_threshold = _completion_reminder_threshold_seconds()
+                _should_completion_remind = (
+                    _completion_threshold is not None
+                    and _response_time >= _completion_threshold
+                    and _platform_name == _COMPLETION_REMINDER_PLATFORM
+                )
+                if _should_completion_remind and session_key:
+                    _delivery_adapter = self.adapters.get(source.platform)
+                    _existing_delivery_callback = None
+                    if (
+                        _delivery_adapter
+                        and getattr(type(_delivery_adapter), "pop_post_delivery_callback", None) is not None
+                    ):
+                        _existing_delivery_callback = _delivery_adapter.pop_post_delivery_callback(
+                            session_key,
+                            generation=run_generation,
+                        )
+                    elif _delivery_adapter and hasattr(_delivery_adapter, "_post_delivery_callbacks"):
+                        _existing_delivery_callback = _delivery_adapter._post_delivery_callbacks.pop(
+                            session_key,
+                            None,
+                        )
+
+                    def _completion_reminder_after_delivery(
+                        *,
+                        _previous_callback=_existing_delivery_callback,
+                        _platform_name=_platform_name,
+                        _response_time=_response_time,
+                        _api_calls=_api_calls,
+                        _message_text=message_text,
+                        _response=response,
+                    ) -> None:
+                        if callable(_previous_callback):
+                            try:
+                                _previous_callback()
+                            except Exception as _callback_exc:
+                                logger.debug(
+                                    "post-delivery callback before completion reminder failed: %s",
+                                    _callback_exc,
+                                )
+                        _send_completion_reminder(
+                            platform_name=_platform_name,
+                            elapsed_seconds=_response_time,
+                            api_calls=int(_api_calls or 0),
+                            message_preview=_message_text,
+                            response_preview=_response,
+                        )
+
+                    if (
+                        _delivery_adapter
+                        and getattr(type(_delivery_adapter), "register_post_delivery_callback", None) is not None
+                    ):
+                        _delivery_adapter.register_post_delivery_callback(
+                            session_key,
+                            _completion_reminder_after_delivery,
+                            generation=run_generation,
+                        )
+                    elif _delivery_adapter and hasattr(_delivery_adapter, "_post_delivery_callbacks"):
+                        _delivery_adapter._post_delivery_callbacks[session_key] = _completion_reminder_after_delivery
+            except Exception as _completion_reminder_exc:
+                logger.debug("completion reminder registration skipped: %s", _completion_reminder_exc)
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
