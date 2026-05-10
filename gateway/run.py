@@ -323,7 +323,7 @@ def _completion_reminder_threshold_seconds() -> Optional[float]:
     except (TypeError, ValueError):
         logger.warning("Invalid %s=%r; completion reminders disabled", _COMPLETION_REMINDER_ENV, raw)
         return None
-    if threshold <= 0:
+    if threshold < 0:
         return None
     return threshold
 
