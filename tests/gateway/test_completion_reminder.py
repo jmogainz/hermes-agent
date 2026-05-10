@@ -15,6 +15,18 @@ def test_completion_reminder_threshold_zero_means_every_reply(monkeypatch):
     assert run._completion_reminder_threshold_seconds() == 0
 
 
+def test_completion_reminder_cleanup_seconds(monkeypatch):
+    monkeypatch.setenv("HERMES_COMPLETION_REMINDER_CLEANUP_SECONDS", "120")
+
+    assert run._completion_reminder_cleanup_seconds() == 120
+
+
+def test_completion_reminder_cleanup_seconds_invalid(monkeypatch):
+    monkeypatch.setenv("HERMES_COMPLETION_REMINDER_CLEANUP_SECONDS", "later")
+
+    assert run._completion_reminder_cleanup_seconds() is None
+
+
 def test_completion_reminder_command_targets_current_second():
     command = run._build_completion_reminder_command(
         elapsed_seconds=125,
@@ -32,3 +44,44 @@ def test_completion_reminder_command_targets_current_second():
     assert command[command.index("--due") + 1] == "2026-05-10 12:34:20"
     assert command[command.index("--alarm") + 1] == "2026-05-10 12:34:20"
     assert "The WhatsApp reply has been delivered." in command[command.index("--notes") + 1]
+
+
+def test_completion_reminder_extracts_reminder_id():
+    assert run._extract_reminder_id('{"id":"abc123","title":"done"}') == "abc123"
+    assert run._extract_reminder_id('{"reminder":{"uuid":"rem-1"}}') == "rem-1"
+    assert run._extract_reminder_id("not json") is None
+
+
+def test_completion_reminder_delete_command():
+    assert run._build_completion_reminder_delete_command("/opt/homebrew/bin/remindctl", "abc123") == [
+        "/opt/homebrew/bin/remindctl",
+        "delete",
+        "abc123",
+        "--force",
+        "--no-input",
+        "--json",
+    ]
+
+
+def test_messages_used_browser_tool_detects_direct_and_mcp_calls():
+    assert run._messages_used_browser_tool(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "browser_navigate"}},
+                ],
+            }
+        ]
+    )
+    assert run._messages_used_browser_tool(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "mcp_chrome-devtools_take_snapshot"}},
+                ],
+            }
+        ]
+    )
+    assert not run._messages_used_browser_tool([{"role": "assistant", "content": "no tools"}])

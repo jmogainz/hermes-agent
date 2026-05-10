@@ -44,6 +44,8 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List, Union
+from urllib.parse import quote
+from urllib.request import urlopen
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -303,8 +305,12 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
 
 
 _COMPLETION_REMINDER_ENV = "HERMES_COMPLETION_REMINDER_MIN_SECONDS"
+_COMPLETION_REMINDER_CLEANUP_ENV = "HERMES_COMPLETION_REMINDER_CLEANUP_SECONDS"
+_BROWSER_CLEANUP_AFTER_TURN_ENV = "HERMES_BROWSER_CLEANUP_AFTER_TURN"
+_BROWSER_CLEANUP_CDP_TABS_ENV = "HERMES_BROWSER_CLEANUP_NEW_CDP_TABS_AFTER_TURN"
 _COMPLETION_REMINDER_PLATFORM = "whatsapp"
 _REMINDCTL_FALLBACK_PATH = "/opt/homebrew/bin/remindctl"
+_BROWSER_TOOL_PREFIXES = ("browser_", "mcp_chrome_devtools_", "mcp_chrome-devtools_")
 
 
 def _truncate_for_reminder(value: Any, *, limit: int = 240) -> str:
@@ -327,6 +333,195 @@ def _completion_reminder_threshold_seconds() -> Optional[float]:
     if threshold < 0:
         return None
     return threshold
+
+
+def _completion_reminder_cleanup_seconds() -> Optional[float]:
+    raw = os.getenv(_COMPLETION_REMINDER_CLEANUP_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        cleanup_after = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s=%r; completion reminder cleanup disabled",
+            _COMPLETION_REMINDER_CLEANUP_ENV,
+            raw,
+        )
+        return None
+    if cleanup_after < 0:
+        return None
+    return cleanup_after
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _browser_cleanup_after_turn_enabled() -> bool:
+    return _env_truthy(_BROWSER_CLEANUP_AFTER_TURN_ENV, default=False)
+
+
+def _browser_cleanup_cdp_tabs_enabled() -> bool:
+    return _env_truthy(_BROWSER_CLEANUP_CDP_TABS_ENV, default=True)
+
+
+def _browser_cdp_url() -> str:
+    return os.getenv("BROWSER_CDP_URL", "").strip().rstrip("/")
+
+
+def _extract_reminder_id(output: str) -> Optional[str]:
+    if not output:
+        return None
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        candidates = [
+            payload,
+            payload.get("reminder"),
+            payload.get("data"),
+            payload.get("result"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                for key in ("id", "uuid", "external_id", "externalId"):
+                    value = candidate.get(key)
+                    if value:
+                        return str(value)
+        reminders = payload.get("reminders")
+        if isinstance(reminders, list):
+            for item in reminders:
+                if isinstance(item, dict):
+                    value = item.get("id") or item.get("uuid")
+                    if value:
+                        return str(value)
+    return None
+
+
+def _build_completion_reminder_delete_command(remindctl_path: str, reminder_id: str) -> List[str]:
+    return [
+        remindctl_path,
+        "delete",
+        str(reminder_id),
+        "--force",
+        "--no-input",
+        "--json",
+    ]
+
+
+def _tool_name_from_call(value: Any) -> str:
+    if isinstance(value, dict):
+        if value.get("name"):
+            return str(value.get("name") or "")
+        function = value.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return ""
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    function = getattr(value, "function", None)
+    if function is not None:
+        return str(getattr(function, "name", "") or "")
+    return ""
+
+
+def _is_browser_tool_name(name: str) -> bool:
+    normalized = str(name or "").replace("-", "_")
+    if normalized.startswith(_BROWSER_TOOL_PREFIXES):
+        return True
+    return "chrome_devtools" in normalized
+
+
+def _messages_used_browser_tool(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if _is_browser_tool_name(str(message.get("name") or "")):
+            return True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if _is_browser_tool_name(_tool_name_from_call(tool_call)):
+                    return True
+    return False
+
+
+def _snapshot_cdp_page_target_ids() -> Optional[set[str]]:
+    cdp_url = _browser_cdp_url()
+    if not cdp_url or not _browser_cleanup_cdp_tabs_enabled():
+        return None
+    try:
+        with urlopen(f"{cdp_url}/json/list", timeout=2) as response:
+            targets = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.debug("CDP target snapshot skipped: %s", exc)
+        return None
+    if not isinstance(targets, list):
+        return None
+    result: set[str] = set()
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        if target.get("type") != "page":
+            continue
+        target_id = target.get("id")
+        if target_id:
+            result.add(str(target_id))
+    return result
+
+
+def _close_cdp_page_targets(target_ids: set[str]) -> int:
+    cdp_url = _browser_cdp_url()
+    if not cdp_url or not target_ids:
+        return 0
+    closed = 0
+    for target_id in sorted(target_ids):
+        try:
+            with urlopen(f"{cdp_url}/json/close/{quote(target_id, safe='')}", timeout=2):
+                pass
+            closed += 1
+        except Exception as exc:
+            logger.debug("Failed to close CDP target %s: %s", target_id, exc)
+    return closed
+
+
+def _cleanup_browser_after_turn(
+    *,
+    task_ids: List[str],
+    cdp_targets_before: Optional[set[str]] = None,
+) -> None:
+    cleaned_task_ids: list[str] = []
+    for task_id in task_ids:
+        if not task_id or task_id in cleaned_task_ids:
+            continue
+        try:
+            from tools.browser_tool import cleanup_browser
+
+            cleanup_browser(task_id)
+            cleaned_task_ids.append(task_id)
+        except Exception as exc:
+            logger.debug("browser cleanup for task %s skipped: %s", task_id, exc)
+
+    closed_tabs = 0
+    if cdp_targets_before is not None:
+        cdp_targets_after = _snapshot_cdp_page_target_ids()
+        if cdp_targets_after is not None:
+            new_targets = cdp_targets_after - cdp_targets_before
+            closed_tabs = _close_cdp_page_targets(new_targets)
+
+    if cleaned_task_ids or closed_tabs:
+        logger.info(
+            "Browser automation cleanup complete: task_ids=%s closed_cdp_tabs=%d",
+            cleaned_task_ids,
+            closed_tabs,
+        )
 
 
 def _format_duration(seconds: float) -> str:
@@ -402,6 +597,7 @@ def _send_completion_reminder(
     )
 
     def _run_reminder_command() -> None:
+        remindctl_path = command[0]
         try:
             result = subprocess.run(
                 command,
@@ -421,6 +617,30 @@ def _send_completion_reminder(
             )
             return
         logger.info("Completion reminder created for WhatsApp task after %.1fs", elapsed_seconds)
+        cleanup_after = _completion_reminder_cleanup_seconds()
+        reminder_id = _extract_reminder_id(result.stdout or "")
+        if cleanup_after is None or not reminder_id:
+            return
+        try:
+            time.sleep(cleanup_after)
+            delete_result = subprocess.run(
+                _build_completion_reminder_delete_command(remindctl_path, reminder_id),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning("Completion reminder cleanup failed: %s", exc)
+            return
+        if delete_result.returncode != 0:
+            logger.warning(
+                "Completion reminder cleanup failed with exit %s: %s",
+                delete_result.returncode,
+                (delete_result.stderr or delete_result.stdout or "").strip(),
+            )
+            return
+        logger.info("Completion reminder cleaned up after %.1fs", cleanup_after)
 
     try:
         threading.Thread(
@@ -682,12 +902,26 @@ if _config_path.exists():
                 os.environ["HERMES_COMPLETION_REMINDER_MIN_SECONDS"] = str(
                     _agent_cfg["completion_reminder_min_seconds"]
                 )
+            if "completion_reminder_cleanup_seconds" in _agent_cfg:
+                os.environ["HERMES_COMPLETION_REMINDER_CLEANUP_SECONDS"] = str(
+                    _agent_cfg["completion_reminder_cleanup_seconds"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
                 )
+        _browser_cfg = _cfg.get("browser", {})
+        if _browser_cfg and isinstance(_browser_cfg, dict):
+            if "cleanup_after_turn" in _browser_cfg:
+                os.environ["HERMES_BROWSER_CLEANUP_AFTER_TURN"] = str(_browser_cfg["cleanup_after_turn"])
+            if "cleanup_new_cdp_tabs_after_turn" in _browser_cfg:
+                os.environ["HERMES_BROWSER_CLEANUP_NEW_CDP_TABS_AFTER_TURN"] = str(
+                    _browser_cfg["cleanup_new_cdp_tabs_after_turn"]
+                )
+            if "cdp_url" in _browser_cfg:
+                os.environ["BROWSER_CDP_URL"] = str(_browser_cfg["cdp_url"])
         _display_cfg = _cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg:
@@ -8023,13 +8257,20 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            _browser_targets_before = (
+                _snapshot_cdp_page_target_ids()
+                if _browser_cleanup_after_turn_enabled()
+                else None
+            )
+            _agent_task_session_id = session_entry.session_id
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
-                session_id=session_entry.session_id,
+                session_id=_agent_task_session_id,
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
@@ -8089,7 +8330,21 @@ class GatewayRunner:
                     and _response_time >= _completion_threshold
                     and _platform_name == _COMPLETION_REMINDER_PLATFORM
                 )
-                if _should_completion_remind and session_key:
+                _browser_task_ids: list[str] = []
+                _should_browser_cleanup = (
+                    _browser_cleanup_after_turn_enabled()
+                    and _messages_used_browser_tool(agent_messages)
+                )
+                if _should_browser_cleanup:
+                    for _task_id in (
+                        _agent_task_session_id,
+                        session_entry.session_id,
+                        str(agent_result.get("session_id") or ""),
+                    ):
+                        if _task_id and _task_id not in _browser_task_ids:
+                            _browser_task_ids.append(_task_id)
+
+                if (_should_completion_remind or _should_browser_cleanup) and session_key:
                     _delivery_adapter = self.adapters.get(source.platform)
                     _existing_delivery_callback = None
                     if (
@@ -8106,7 +8361,7 @@ class GatewayRunner:
                             None,
                         )
 
-                    def _completion_reminder_after_delivery(
+                    def _automation_cleanup_after_delivery(
                         *,
                         _previous_callback=_existing_delivery_callback,
                         _platform_name=_platform_name,
@@ -8114,6 +8369,10 @@ class GatewayRunner:
                         _api_calls=_api_calls,
                         _message_text=message_text,
                         _response=response,
+                        _should_completion_remind=_should_completion_remind,
+                        _should_browser_cleanup=_should_browser_cleanup,
+                        _browser_task_ids=_browser_task_ids,
+                        _browser_targets_before=_browser_targets_before,
                     ) -> None:
                         if callable(_previous_callback):
                             try:
@@ -8123,13 +8382,19 @@ class GatewayRunner:
                                     "post-delivery callback before completion reminder failed: %s",
                                     _callback_exc,
                                 )
-                        _send_completion_reminder(
-                            platform_name=_platform_name,
-                            elapsed_seconds=_response_time,
-                            api_calls=int(_api_calls or 0),
-                            message_preview=_message_text,
-                            response_preview=_response,
-                        )
+                        if _should_completion_remind:
+                            _send_completion_reminder(
+                                platform_name=_platform_name,
+                                elapsed_seconds=_response_time,
+                                api_calls=int(_api_calls or 0),
+                                message_preview=_message_text,
+                                response_preview=_response,
+                            )
+                        if _should_browser_cleanup:
+                            _cleanup_browser_after_turn(
+                                task_ids=list(_browser_task_ids),
+                                cdp_targets_before=_browser_targets_before,
+                            )
 
                     if (
                         _delivery_adapter
@@ -8137,13 +8402,13 @@ class GatewayRunner:
                     ):
                         _delivery_adapter.register_post_delivery_callback(
                             session_key,
-                            _completion_reminder_after_delivery,
+                            _automation_cleanup_after_delivery,
                             generation=run_generation,
                         )
                     elif _delivery_adapter and hasattr(_delivery_adapter, "_post_delivery_callbacks"):
-                        _delivery_adapter._post_delivery_callbacks[session_key] = _completion_reminder_after_delivery
-            except Exception as _completion_reminder_exc:
-                logger.debug("completion reminder registration skipped: %s", _completion_reminder_exc)
+                        _delivery_adapter._post_delivery_callbacks[session_key] = _automation_cleanup_after_delivery
+            except Exception as _automation_cleanup_exc:
+                logger.debug("post-delivery automation cleanup registration skipped: %s", _automation_cleanup_exc)
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
