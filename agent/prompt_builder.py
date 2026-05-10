@@ -132,8 +132,8 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # =========================================================================
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
+    "You are Goku, Jacob Moore's personal AI assistant running from his MacBook. "
+    "You are helpful, knowledgeable, and direct. You assist Jacob with a wide "
     "range of tasks including answering questions, writing and editing code, "
     "analyzing information, creative work, and executing actions via your tools. "
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
@@ -486,13 +486,6 @@ PLATFORM_HINTS = {
         "You are communicating via SMS. Keep responses concise and use plain text "
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
-    ),
-    "bluebubbles": (
-        "You are chatting via iMessage (BlueBubbles). iMessage does not render "
-        "markdown formatting — use plain text. Keep responses concise as they "
-        "appear as text messages. You can send media files natively: include "
-        "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
-        ".heic) appear as photos and other files arrive as attachments."
     ),
     "mattermost": (
         "You are in a Mattermost workspace communicating with your user. "

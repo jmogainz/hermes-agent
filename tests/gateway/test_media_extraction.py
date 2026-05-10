@@ -10,6 +10,8 @@ times per reply. (Regression test for #160)
 import pytest
 import re
 
+from gateway.run import _collect_media_tags_from_tool_messages
+
 
 def extract_media_tags_fixed(result_messages, history_len):
     """
@@ -178,6 +180,57 @@ class TestMediaExtraction:
         seen = set()
         unique = [t for t in tags if t not in seen and not seen.add(t)]
         assert len(unique) == 2  # After dedup: same.ogg and different.ogg
+
+    def test_tool_scanner_ignores_media_mentions_in_session_search_summaries(self):
+        """Session search output can mention old MEDIA tags without redelivering them."""
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '[{"session_id":"old","summary":"Prior transcript noted: '
+                    '- `MEDIA:/Users/jmogainz/resume/JacobLMoore_CV.pdf`"}]'
+                ),
+            }
+        ]
+
+        tags, voice_directive = _collect_media_tags_from_tool_messages(messages)
+
+        assert tags == []
+        assert voice_directive is False
+
+    def test_tool_scanner_extracts_explicit_json_media_fields(self):
+        """TTS-style JSON media fields should still auto-deliver."""
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '{"success":true,"media_tag":"[[audio_as_voice]]\\n'
+                    'MEDIA:/Users/jmogainz/.hermes/audio_cache/reply.ogg"}'
+                ),
+            }
+        ]
+
+        tags, voice_directive = _collect_media_tags_from_tool_messages(messages)
+
+        assert tags == ["MEDIA:/Users/jmogainz/.hermes/audio_cache/reply.ogg"]
+        assert voice_directive is True
+
+    def test_tool_scanner_does_not_extract_arbitrary_json_text_fields(self):
+        """Arbitrary JSON text fields are not delivery directives."""
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    '{"content":"MEDIA:/Users/jmogainz/resume/'
+                    'JacobLMoore_CV.pdf"}'
+                ),
+            }
+        ]
+
+        tags, voice_directive = _collect_media_tags_from_tool_messages(messages)
+
+        assert tags == []
+        assert voice_directive is False
 
 
 if __name__ == "__main__":

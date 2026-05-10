@@ -116,7 +116,6 @@ class TestResolveDeliveryTarget:
             "SMS_HOME_CHANNEL",
             "EMAIL_HOME_ADDRESS",
             "DINGTALK_HOME_CHANNEL",
-            "BLUEBUBBLES_HOME_CHANNEL",
             "FEISHU_HOME_CHANNEL",
             "WECOM_HOME_CHANNEL",
             "WEIXIN_HOME_CHANNEL",

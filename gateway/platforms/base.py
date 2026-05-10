@@ -2134,10 +2134,15 @@ class BasePlatformAdapter(ABC):
         # keep it out of the user-visible cleaned text.
         cleaned = cleaned.replace("[[as_document]]", "")
         
-        # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
-        # and quoted/backticked paths for LLM-formatted outputs.
+        # Extract MEDIA:<path> tags only when they are deliberate delivery
+        # directives on their own logical line. Do not treat quoted transcript
+        # snippets (e.g. "- `MEDIA:/old/file.pdf`") or inline syntax examples as
+        # attachments, because that can accidentally resend files mentioned while
+        # debugging prior sessions.
+        media_exts = r"png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa"
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''(?m)^[ \t]*MEDIA:\s*(?P<path>`[^`\n]+\.(?:''' + media_exts + r''')`|"[^"\n]+\.(?:''' + media_exts + r''')"|'[^'\n]+\.(?:''' + media_exts + r''')'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:''' + media_exts + r''')(?=[\s`"',;:)\]}]|$))[ \t]*[`"']?''',
+            re.IGNORECASE,
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()

@@ -265,14 +265,42 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    source_filter: str = None,
+    same_source_only: bool = False,
+    same_user_only: bool = False,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
+    def _latest_resume_preview(session_id: str) -> Dict[str, Any]:
+        try:
+            messages = db.get_messages(session_id)
+        except Exception:
+            return {}
+        for msg in reversed(messages):
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user" or (
+                role == "session_meta"
+                and content.startswith("[Inbound message checkpoint before agent run]")
+            ):
+                cleaned = content.replace("[Inbound message checkpoint before agent run]", "").strip()
+                cleaned = re.sub(r"\s+", " ", cleaned)
+                return {
+                    "latest_user_or_checkpoint": cleaned[:240] + ("..." if len(cleaned) > 240 else ""),
+                    "latest_user_or_checkpoint_at": msg.get("timestamp"),
+                    "latest_was_checkpoint": role == "session_meta",
+                }
+        return {}
+
     try:
-        sessions = db.list_sessions_rich(
-            limit=limit + 5,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            order_by_last_active=True,
-        )  # fetch extra to skip current
+        current_session = None
+        current_source = None
+        current_user_id = None
 
         # Resolve current session lineage to exclude it
         current_root = None
@@ -285,10 +313,29 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                     visited.add(sid)
                     current_root = sid
                     s = db.get_session(sid)
+                    if sid == current_session_id:
+                        current_session = s
                     parent = s.get("parent_session_id") if s else None
                     sid = parent if parent else None
             except Exception:
                 current_root = current_session_id
+
+        if current_session:
+            current_source = current_session.get("source")
+            current_user_id = current_session.get("user_id")
+
+        if same_source_only and current_source:
+            source_filter = current_source
+
+        # Fetch extra rows because current-session, child-session, and same-user
+        # filtering can discard many candidates. This keeps "resume/continue"
+        # lookups useful without adding LLM cost.
+        sessions = db.list_sessions_rich(
+            source=source_filter,
+            limit=max(limit + 10, limit * 4),
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            order_by_last_active=True,
+        )
 
         results = []
         for s in sessions:
@@ -298,21 +345,30 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             # Skip child/delegation sessions (they have parent_session_id)
             if s.get("parent_session_id"):
                 continue
-            results.append({
+            if same_user_only and current_user_id and s.get("user_id") != current_user_id:
+                continue
+            entry = {
                 "session_id": sid,
                 "title": s.get("title") or None,
                 "source": s.get("source", ""),
+                "same_source": bool(current_source and s.get("source") == current_source),
+                "same_user": bool(current_user_id and s.get("user_id") == current_user_id),
                 "started_at": s.get("started_at", ""),
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
                 "preview": s.get("preview", ""),
-            })
+            }
+            entry.update(_latest_resume_preview(sid))
+            results.append(entry)
             if len(results) >= limit:
                 break
 
         return json.dumps({
             "success": True,
             "mode": "recent",
+            "source_filter": source_filter,
+            "same_source_only": same_source_only,
+            "same_user_only": same_user_only,
             "results": results,
             "count": len(results),
             "message": f"Showing {len(results)} most recent sessions. Use a keyword query to search specific topics.",
@@ -325,6 +381,9 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
 def session_search(
     query: str,
     role_filter: str = None,
+    source_filter: str = None,
+    same_source_only: bool = False,
+    same_user_only: bool = False,
     limit: int = 3,
     db=None,
     current_session_id: str = None,
@@ -359,7 +418,14 @@ def session_search(
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            source_filter=source_filter,
+            same_source_only=same_source_only,
+            same_user_only=same_user_only,
+        )
 
     query = query.strip()
 
@@ -369,9 +435,26 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
+        current_session = None
+        current_source = None
+        current_user_id = None
+        if current_session_id:
+            try:
+                current_session = db.get_session(current_session_id)
+            except Exception:
+                current_session = None
+        if current_session:
+            current_source = current_session.get("source")
+            current_user_id = current_session.get("user_id")
+
+        effective_source_filter = source_filter
+        if same_source_only and current_source:
+            effective_source_filter = current_source
+
         # FTS5 search -- get matches ranked by relevance
         raw_results = db.search_messages(
             query=query,
+            source_filter=[effective_source_filter] if effective_source_filter else None,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
@@ -431,6 +514,20 @@ def session_search(
                 continue
             if current_session_id and raw_sid == current_session_id:
                 continue
+            if same_source_only and current_source:
+                try:
+                    resolved_meta = db.get_session(resolved_sid) or {}
+                except Exception:
+                    resolved_meta = {}
+                if resolved_meta.get("source") != current_source:
+                    continue
+            if same_user_only and current_user_id:
+                try:
+                    resolved_meta = db.get_session(resolved_sid) or {}
+                except Exception:
+                    resolved_meta = {}
+                if resolved_meta.get("user_id") != current_user_id:
+                    continue
             if resolved_sid not in seen_sessions:
                 result = dict(result)
                 result["session_id"] = resolved_sid
@@ -555,7 +652,9 @@ SESSION_SEARCH_SCHEMA = {
         "TWO MODES:\n"
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
-        "Start here when the user asks what were we working on or what did we do recently.\n"
+        "Start here when the user asks what were we working on or what did we do recently. "
+        "For messaging/gateway resume requests, use same_source_only=true and same_user_only=true first "
+        "so you recover the immediate prior thread from this same chat/user before browsing unrelated sessions.\n"
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
         "Returns LLM-generated summaries of matching sessions.\n\n"
         "USE THIS PROACTIVELY when:\n"
@@ -583,6 +682,20 @@ SESSION_SEARCH_SCHEMA = {
                 "type": "string",
                 "description": "Optional: only search messages from specific roles (comma-separated). E.g. 'user,assistant' to skip tool outputs.",
             },
+            "source_filter": {
+                "type": "string",
+                "description": "Optional: only search sessions from one source, such as 'whatsapp', 'cli', or 'cron'. For WhatsApp resume/continue requests, prefer same_source_only instead of hardcoding.",
+            },
+            "same_source_only": {
+                "type": "boolean",
+                "description": "When true, restrict results to the current session's source/platform. Use this for resume/continue requests from a messaging gateway.",
+                "default": False,
+            },
+            "same_user_only": {
+                "type": "boolean",
+                "description": "When true, restrict results to the current session's user_id when available. Use this with same_source_only for 'continue where we left off' in WhatsApp/Telegram/etc.; if it returns nothing, retry with same_source_only only.",
+                "default": False,
+            },
             "limit": {
                 "type": "integer",
                 "description": "Max sessions to summarize (default: 3, max: 5).",
@@ -604,6 +717,9 @@ registry.register(
     handler=lambda args, **kw: session_search(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
+        source_filter=args.get("source_filter"),
+        same_source_only=bool(args.get("same_source_only", False)),
+        same_user_only=bool(args.get("same_user_only", False)),
         limit=args.get("limit", 3),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),

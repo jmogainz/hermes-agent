@@ -661,6 +661,79 @@ from gateway.whatsapp_identity import (
 )
 
 
+def _iter_strings(value: Any):
+    """Yield string leaves from a parsed JSON value."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_strings(child)
+
+
+def _iter_json_media_strings(value: Any):
+    """Yield string values from JSON fields that are explicitly media/delivery data."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_norm = str(key).lower()
+            if "media" in key_norm or key_norm in {
+                "delivery_content",
+                "attachment",
+                "attachments",
+                "file",
+                "files",
+            }:
+                yield from _iter_strings(child)
+            yield from _iter_json_media_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_json_media_strings(child)
+
+
+def _collect_media_tags_from_tool_messages(
+    messages: List[Dict[str, Any]],
+    history_media_paths: Optional[set] = None,
+) -> tuple[List[str], bool]:
+    """Collect deliberate MEDIA directives from tool/function results.
+
+    Tool outputs can contain old transcript snippets from session search. Those
+    snippets may mention MEDIA paths that were delivered in a previous turn. Use
+    the platform adapter's stricter line-based parser, and only inspect JSON
+    fields that are explicitly media/delivery payloads.
+    """
+    history_media_paths = history_media_paths or set()
+    media_tags: List[str] = []
+    has_voice_directive = False
+
+    for msg in messages:
+        if msg.get("role") not in ("tool", "function"):
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str) or (
+            "MEDIA:" not in content and "[[audio_as_voice]]" not in content
+        ):
+            continue
+
+        candidates = [content]
+        stripped = content.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                candidates.extend(_iter_json_media_strings(json.loads(stripped)))
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            media_files, _ = BasePlatformAdapter.extract_media(candidate)
+            for path, is_voice in media_files:
+                if path and path not in history_media_paths:
+                    media_tags.append(f"MEDIA:{path}")
+                    has_voice_directive = has_voice_directive or is_voice
+
+    return media_tags, has_voice_directive
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -3414,7 +3487,6 @@ class GatewayRunner:
             "WECOM_ALLOWED_USERS",
             "WECOM_CALLBACK_ALLOWED_USERS",
             "WEIXIN_ALLOWED_USERS",
-            "BLUEBUBBLES_ALLOWED_USERS",
             "QQ_ALLOWED_USERS",
             "YUANBAO_ALLOWED_USERS",
             "GATEWAY_ALLOWED_USERS",
@@ -3429,7 +3501,6 @@ class GatewayRunner:
             "WECOM_ALLOW_ALL_USERS",
             "WECOM_CALLBACK_ALLOW_ALL_USERS",
             "WEIXIN_ALLOW_ALL_USERS",
-            "BLUEBUBBLES_ALLOW_ALL_USERS",
             "QQ_ALLOW_ALL_USERS",
             "YUANBAO_ALLOW_ALL_USERS",
         )
@@ -5545,12 +5616,6 @@ class GatewayRunner:
                 return None
             return MSGraphWebhookAdapter(config)
 
-        elif platform == Platform.BLUEBUBBLES:
-            from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
-            if not check_bluebubbles_requirements():
-                logger.warning("BlueBubbles: aiohttp/httpx missing or BLUEBUBBLES_SERVER_URL/BLUEBUBBLES_PASSWORD not configured")
-                return None
-            return BlueBubblesAdapter(config)
 
         elif platform == Platform.QQBOT:
             from gateway.platforms.qqbot import QQAdapter, check_qq_requirements
@@ -5605,7 +5670,6 @@ class GatewayRunner:
             Platform.WECOM: "WECOM_ALLOWED_USERS",
             Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
-            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
         }
@@ -5631,7 +5695,6 @@ class GatewayRunner:
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
             Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
-            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
         }
@@ -5817,7 +5880,6 @@ class GatewayRunner:
                 Platform.WECOM:    "WECOM_ALLOWED_USERS",
                 Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
-                Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
             }
             platform_group_env_map = {
@@ -7223,6 +7285,7 @@ class GatewayRunner:
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview,
         )
+        _raw_inbound_text = event.text or ""
 
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
@@ -7400,6 +7463,28 @@ class GatewayRunner:
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+
+        # Crash/restart recovery checkpoint. Normal agent transcript flushing
+        # happens after the turn completes; if the gateway is restarted mid-turn,
+        # the triggering user request can otherwise exist only in gateway.log.
+        # Store a metadata checkpoint after loading history so the current model
+        # turn does not see a duplicate message, but future resume/session_search
+        # can still recover the exact interrupted request.
+        if _raw_inbound_text.strip():
+            try:
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "content": (
+                            "[Inbound message checkpoint before agent run] "
+                            + _raw_inbound_text.strip()
+                        ),
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                )
+            except Exception as exc:
+                logger.debug("Failed to write inbound checkpoint: %s", exc)
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -12768,7 +12853,7 @@ class GatewayRunner:
         Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP,
         Platform.SIGNAL, Platform.MATTERMOST, Platform.MATRIX,
         Platform.HOMEASSISTANT, Platform.EMAIL, Platform.SMS, Platform.DINGTALK,
-        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
+        Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.QQBOT, Platform.LOCAL,
     })
 
     async def _handle_debug_command(self, event: MessageEvent) -> str:
@@ -14922,7 +15007,7 @@ class GatewayRunner:
                 return
 
             # Skip tool progress for platforms that don't support message
-            # editing (e.g. iMessage/BlueBubbles) — each progress update
+            # editing — each progress update
             # would become a separate message bubble, which is noisy.
             if type(adapter).edit_message is BasePlatformAdapter.edit_message:
                 while not progress_queue.empty():
@@ -15621,13 +15706,10 @@ class GatewayRunner:
             # even if the message list shrinks, we know which paths are old.
             _history_media_paths: set = set()
             for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+                if _hm.get("role") in ("tool", "function"):
+                    _tags, _ = _collect_media_tags_from_tool_messages([_hm])
+                    for _tag in _tags:
+                        _history_media_paths.add(_tag.removeprefix("MEDIA:"))
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -15907,18 +15989,10 @@ class GatewayRunner:
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
             if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in {"tool", "function"}:
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
+                media_tags, has_voice_directive = _collect_media_tags_from_tool_messages(
+                    result.get("messages", []),
+                    _history_media_paths,
+                )
                 
                 if media_tags:
                     seen = set()

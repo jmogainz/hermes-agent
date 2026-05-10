@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Hermes Agent WhatsApp Bridge
+ * Goku WhatsApp Bridge
  *
  * Standalone Node.js process that connects to WhatsApp via Baileys
  * and exposes HTTP endpoints for the Python gateway adapter.
@@ -45,13 +45,15 @@ const WHATSAPP_DEBUG =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const QR_FILE = getArg('qr-file', process.env.WHATSAPP_QR_FILE || '');
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 const PAIR_ONLY = args.includes('--pair-only');
+const PAIR_PHONE = getArg('pair-phone', process.env.WHATSAPP_PAIR_PHONE || '').replace(/\D/g, '');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
-const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+const DEFAULT_REPLY_PREFIX = '*Goku*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
@@ -176,6 +178,7 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let pairingCodeRequested = false;
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -186,7 +189,7 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
+    browser: ['Goku', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
@@ -203,7 +206,10 @@ async function startSocket() {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    if (qr && !PAIR_PHONE) {
+      if (QR_FILE) {
+        writeFileSync(QR_FILE, qr);
+      }
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
@@ -235,6 +241,20 @@ async function startSocket() {
       }
     }
   });
+
+  if (PAIR_ONLY && PAIR_PHONE && !state.creds.registered && !pairingCodeRequested) {
+    pairingCodeRequested = true;
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(PAIR_PHONE);
+        console.log(`\n🔢 WhatsApp pairing code for ${PAIR_PHONE}: ${code}\n`);
+        console.log('On your phone: WhatsApp → Settings → Linked Devices → Link with phone number instead');
+        console.log('Enter the code above when prompted.\n');
+      } catch (err) {
+        console.error(`❌ Failed to request pairing code: ${err?.message || err}`);
+      }
+    }, 3000);
+  }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     // In self-chat mode, your own messages commonly arrive as 'append' rather

@@ -402,6 +402,23 @@ class TestShouldSendMediaAsAudio:
         assert should_send_media_as_audio(Platform.TELEGRAM, ".mp3") is True
         assert should_send_media_as_audio(Platform.TELEGRAM, ".flac") is False
         assert should_send_media_as_audio(Platform.DISCORD, ".flac") is True
+    def test_quoted_transcript_media_marker_is_not_extracted(self):
+        content = "Prior session summary:\n- `MEDIA:/Users/jmogainz/resume/JacobLMoore_CV.pdf`"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
+
+    def test_inline_media_syntax_example_is_not_extracted(self):
+        content = "To send a file, write MEDIA:/absolute/path/to/file in the final response."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
+
+    def test_incomplete_media_path_is_not_extracted(self):
+        content = "MEDIA:/"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
 
 
 # ---------------------------------------------------------------------------
