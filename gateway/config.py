@@ -422,9 +422,6 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.WECOM_CALLBACK: lambda cfg: bool(
         cfg.extra.get("corp_id") or cfg.extra.get("apps")
     ),
-    Platform.BLUEBUBBLES: lambda cfg: bool(
-        cfg.extra.get("server_url") and cfg.extra.get("password")
-    ),
     Platform.QQBOT: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("client_secret")
     ),

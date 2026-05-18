@@ -4715,7 +4715,6 @@ def _builtin_setup_fn(key: str):
         "slack": _s._setup_slack,
         "matrix": _s._setup_matrix,
         "mattermost": _s._setup_mattermost,
-        "bluebubbles": _s._setup_bluebubbles,
         "webhooks": _s._setup_webhooks,
         "signal": _setup_signal,
         "whatsapp": _setup_whatsapp,
