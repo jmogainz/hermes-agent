@@ -1178,6 +1178,150 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
             return None
 
+    def _generate_static_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        n_dropped: int,
+    ) -> str:
+        """Create a deterministic handoff when the LLM summarizer is unavailable.
+
+        This is intentionally less ambitious than the LLM-generated summary,
+        but it is much better than an opaque placeholder. When the auxiliary
+        summarizer times out (notably Codex Responses streams during gateway
+        context hygiene), we still preserve a bounded chronological digest of
+        the removed window: recent user asks, assistant/tool activity, and
+        enough exact snippets to let the next turn infer what happened.
+
+        The digest is capped so compression still frees context space, and all
+        snippets pass through the same redactor as LLM summaries.
+        """
+        def _preview(text: Any, limit: int = 700) -> str:
+            rendered = redact_sensitive_text(_content_text_for_contains(text)).strip()
+            rendered = re.sub(r"\s+", " ", rendered)
+            if len(rendered) > limit:
+                return rendered[: limit - 3].rstrip() + "..."
+            return rendered
+
+        def _role_label(msg: Dict[str, Any]) -> str:
+            role = str(msg.get("role") or "unknown").upper()
+            if role == "TOOL":
+                name = msg.get("name") or msg.get("tool_call_id") or "tool"
+                return f"TOOL:{name}"
+            return role
+
+        def _digest_line(idx: int, msg: Dict[str, Any]) -> str:
+            role = _role_label(msg)
+            preview = _preview(msg.get("content"))
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                names: list[str] = []
+                for tc in tool_calls[:5]:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function") or {}
+                        names.append(str(fn.get("name") or "tool"))
+                    else:
+                        fn = getattr(tc, "function", None)
+                        names.append(str(getattr(fn, "name", "tool")))
+                suffix = f" [tool calls: {', '.join(names)}]"
+            else:
+                suffix = ""
+            if not preview and suffix:
+                preview = "(tool-call-only assistant message)"
+            elif not preview:
+                preview = "(no text content)"
+            return f"{idx}. [{role}] {preview}{suffix}"
+
+        user_turns = [
+            _preview(msg.get("content"), limit=500)
+            for msg in turns_to_summarize
+            if msg.get("role") == "user" and _preview(msg.get("content"), limit=500)
+        ]
+        recent_user_turns = user_turns[-5:]
+
+        # Preserve both the beginning (initial setup) and the end (recent
+        # progress) of the dropped window. For small windows, include all.
+        if len(turns_to_summarize) <= 24:
+            selected: list[tuple[int, Dict[str, Any]]] = list(enumerate(turns_to_summarize, start=1))
+            omitted = 0
+        else:
+            head = list(enumerate(turns_to_summarize[:8], start=1))
+            tail_start = len(turns_to_summarize) - 15
+            tail = list(enumerate(turns_to_summarize[tail_start:], start=tail_start + 1))
+            selected = head + tail
+            omitted = len(turns_to_summarize) - len(selected)
+
+        digest_lines = [_digest_line(i, msg) for i, msg in selected]
+        if omitted:
+            digest_lines.insert(8, f"... {omitted} compacted turn(s) omitted from deterministic digest ...")
+
+        # Hard cap the deterministic digest so a pathological transcript still
+        # compresses. Drop middle digest lines first; preserve tail lines.
+        digest = "\n".join(digest_lines)
+        max_digest_chars = 18_000
+        if len(digest) > max_digest_chars:
+            tail_lines = digest_lines[-14:]
+            head_lines = digest_lines[:6]
+            digest = "\n".join(
+                head_lines
+                + ["... deterministic digest truncated to preserve context budget ..."]
+                + tail_lines
+            )
+            if len(digest) > max_digest_chars:
+                digest = digest[: max_digest_chars - 3].rstrip() + "..."
+
+        latest_compacted_user = recent_user_turns[-1] if recent_user_turns else "None found in compacted window."
+        recent_user_block = (
+            "\n".join(f"- {turn}" for turn in recent_user_turns)
+            if recent_user_turns else
+            "None found in compacted window."
+        )
+        error = self._last_summary_error or "summary LLM unavailable"
+
+        body = f"""## Active Task
+The active user request should appear in the live messages after this summary. If it does not, the most recent compacted user turn was: {latest_compacted_user}
+
+## Goal
+Preserve continuity after context compaction even though the LLM summarizer failed.
+
+## Constraints & Preferences
+This is a deterministic fallback digest, not an LLM synthesis. Treat it as lossy background context and prefer the preserved live tail messages for the current task.
+
+## Completed Actions
+1. Context compression removed {n_dropped} message(s) from the middle of the conversation.
+2. LLM summary generation failed: {redact_sensitive_text(str(error))}
+3. Generated this bounded deterministic digest instead of inserting an opaque context-loss marker.
+
+## Active State
+Use the preserved messages after this summary as the authoritative current state. Earlier compacted activity is represented only by the digest below.
+
+## In Progress
+Unknown from deterministic fallback. Check the live tail messages after this summary.
+
+## Blocked
+LLM context-summary generation was unavailable during compaction: {redact_sensitive_text(str(error))}
+
+## Key Decisions
+Unknown from deterministic fallback unless visible in the compacted-turn digest.
+
+## Resolved Questions
+Unknown from deterministic fallback unless visible in the compacted-turn digest.
+
+## Pending User Asks
+Recent compacted user turns, newest last:
+{recent_user_block}
+
+## Relevant Files
+Unknown from deterministic fallback unless visible in the compacted-turn digest.
+
+## Remaining Work
+Continue from the live messages after this summary. Use the digest only to avoid losing prior context.
+
+## Critical Context
+Deterministic compacted-turn digest:
+{digest}"""
+        return self._with_summary_prefix(body)
+
     @staticmethod
     def _strip_summary_prefix(summary: str) -> str:
         """Return summary body without the current or legacy handoff prefix."""
@@ -1594,21 +1738,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     )
             compressed.append(msg)
 
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
+        # If LLM summary failed, insert a deterministic fallback digest so the
+        # model gets bounded continuity instead of an opaque context-loss marker.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
+                logger.warning("Summary generation failed — inserting deterministic fallback context digest")
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"messages contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+            summary = self._generate_static_fallback_summary(
+                turns_to_summarize,
+                n_dropped=n_dropped,
             )
+            self._previous_summary = self._strip_summary_prefix(summary)
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

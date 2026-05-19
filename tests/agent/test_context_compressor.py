@@ -743,11 +743,47 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
+        # Result must still be well-formed (deterministic fallback digest present).
         assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
+            isinstance(m.get("content"), str)
+            and "Deterministic compacted-turn digest" in m["content"]
+            and "msg 3" in m["content"]
             for m in result
         )
+
+    def test_codex_timeout_fallback_preserves_compacted_turn_digest(self):
+        """Regression for gateway warning: Codex auxiliary timeout should not
+        replace removed turns with only an opaque 'could not summarize' marker.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="gpt-5.5", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "start Canonical interview prep"},
+            {"role": "assistant", "content": "loaded resume repo"},
+            {"role": "user", "content": "also populate memory system"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"function": {"name": "mcp_gbrain_put_page", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "name": "mcp_gbrain_put_page", "content": "stored resume profile"},
+            {"role": "assistant", "content": "memory populated"},
+            {"role": "user", "content": "what should I do next?"},
+            {"role": "assistant", "content": "practice STAR stories"},
+            {"role": "user", "content": "latest live user turn should stay in tail"},
+        ]
+
+        err = TimeoutError("Codex auxiliary Responses stream exceeded 120.0s total timeout")
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            result = c.compress(msgs)
+
+        contents = [str(m.get("content")) for m in result if isinstance(m.get("content"), str)]
+        fallback = next(item for item in contents if "Deterministic compacted-turn digest" in item)
+        assert "Codex auxiliary Responses stream exceeded 120.0s total timeout" in fallback
+        assert "also populate memory system" in fallback
+        assert "mcp_gbrain_put_page" in fallback
+        assert "Summary generation was unavailable" not in fallback
+        assert c._previous_summary is not None
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
