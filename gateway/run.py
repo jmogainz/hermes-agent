@@ -532,29 +532,15 @@ def _format_duration(seconds: float) -> str:
     return f"{rem}s"
 
 
-def _build_completion_reminder_command(
+def _build_reminder_add_command(
     *,
-    elapsed_seconds: float,
-    api_calls: int,
-    message_preview: str,
-    response_preview: str,
+    title: str,
+    notes_parts: List[str],
     now: Optional[datetime] = None,
 ) -> List[str]:
+    """Build the shared transient Apple Reminders notification command."""
     due_at = now or datetime.now()
     due = due_at.strftime("%Y-%m-%d %H:%M:%S")
-    duration = _format_duration(elapsed_seconds)
-    title = f"Goku finished your WhatsApp task ({duration})"
-    notes_parts = [
-        "The WhatsApp reply has been delivered.",
-        f"Runtime: {duration}",
-        f"API calls: {api_calls}",
-    ]
-    request = _truncate_for_reminder(message_preview)
-    if request:
-        notes_parts.append(f"Request: {request}")
-    response = _truncate_for_reminder(response_preview)
-    if response:
-        notes_parts.append(f"Reply: {response}")
     remindctl_path = shutil.which("remindctl") or _REMINDCTL_FALLBACK_PATH
     return [
         remindctl_path,
@@ -572,29 +558,66 @@ def _build_completion_reminder_command(
     ]
 
 
-def _send_completion_reminder(
+def _build_completion_reminder_command(
     *,
-    platform_name: str,
     elapsed_seconds: float,
     api_calls: int,
     message_preview: str,
     response_preview: str,
-) -> bool:
-    threshold = _completion_reminder_threshold_seconds()
-    if threshold is None or elapsed_seconds < threshold:
-        return False
-    if str(platform_name or "").lower() != _COMPLETION_REMINDER_PLATFORM:
-        return False
-    if shutil.which("remindctl") is None and not Path(_REMINDCTL_FALLBACK_PATH).exists():
-        logger.warning("Completion reminder skipped: remindctl is not installed")
-        return False
+    now: Optional[datetime] = None,
+) -> List[str]:
+    duration = _format_duration(elapsed_seconds)
+    title = f"Goku finished your WhatsApp task ({duration})"
+    notes_parts = [
+        "The WhatsApp reply has been delivered.",
+        f"Runtime: {duration}",
+        f"API calls: {api_calls}",
+    ]
+    request = _truncate_for_reminder(message_preview)
+    if request:
+        notes_parts.append(f"Request: {request}")
+    response = _truncate_for_reminder(response_preview)
+    if response:
+        notes_parts.append(f"Reply: {response}")
+    return _build_reminder_add_command(title=title, notes_parts=notes_parts, now=now)
 
-    command = _build_completion_reminder_command(
-        elapsed_seconds=elapsed_seconds,
-        api_calls=api_calls,
-        message_preview=message_preview,
-        response_preview=response_preview,
+
+def _build_approval_reminder_command(
+    *,
+    command: str,
+    description: str,
+    now: Optional[datetime] = None,
+) -> List[str]:
+    cmd_preview = _truncate_for_reminder(command)
+    desc_preview = _truncate_for_reminder(description)
+    notes_parts = ["The WhatsApp approval prompt has been delivered."]
+    if desc_preview:
+        notes_parts.append(f"Reason: {desc_preview}")
+    if cmd_preview:
+        notes_parts.append(f"Command: {cmd_preview}")
+    return _build_reminder_add_command(
+        title="Goku needs command approval",
+        notes_parts=notes_parts,
+        now=now,
     )
+
+
+def _queue_transient_reminder(
+    *,
+    command: List[str],
+    thread_name: str,
+    log_label: str,
+    created_log: str,
+    queued_log: str,
+) -> bool:
+    """Run a remindctl notification in the background and clean it up later.
+
+    This is shared by final-response notifications and command-approval
+    notifications so both paths use identical Apple Reminders behavior.
+    """
+    if shutil.which("remindctl") is None and not Path(_REMINDCTL_FALLBACK_PATH).exists():
+        logger.warning("%s reminder skipped: remindctl is not installed", log_label)
+        return False
 
     def _run_reminder_command() -> None:
         remindctl_path = command[0]
@@ -607,16 +630,17 @@ def _send_completion_reminder(
                 timeout=60,
             )
         except Exception as exc:
-            logger.warning("Completion reminder failed: %s", exc)
+            logger.warning("%s reminder failed: %s", log_label, exc)
             return
         if result.returncode != 0:
             logger.warning(
-                "Completion reminder failed with exit %s: %s",
+                "%s reminder failed with exit %s: %s",
+                log_label,
                 result.returncode,
                 (result.stderr or result.stdout or "").strip(),
             )
             return
-        logger.info("Completion reminder created for WhatsApp task after %.1fs", elapsed_seconds)
+        logger.info(created_log)
         cleanup_after = _completion_reminder_cleanup_seconds()
         reminder_id = _extract_reminder_id(result.stdout or "")
         if cleanup_after is None or not reminder_id:
@@ -631,31 +655,79 @@ def _send_completion_reminder(
                 timeout=30,
             )
         except Exception as exc:
-            logger.warning("Completion reminder cleanup failed: %s", exc)
+            logger.warning("%s reminder cleanup failed: %s", log_label, exc)
             return
         if delete_result.returncode != 0:
             logger.warning(
-                "Completion reminder cleanup failed with exit %s: %s",
+                "%s reminder cleanup failed with exit %s: %s",
+                log_label,
                 delete_result.returncode,
                 (delete_result.stderr or delete_result.stdout or "").strip(),
             )
             return
-        logger.info("Completion reminder cleaned up after %.1fs", cleanup_after)
+        logger.info("%s reminder cleaned up after %.1fs", log_label, cleanup_after)
 
     try:
         threading.Thread(
             target=_run_reminder_command,
-            name="completion-reminder",
+            name=thread_name,
             daemon=True,
         ).start()
     except Exception as exc:
-        logger.warning("Completion reminder thread failed to start: %s", exc)
+        logger.warning("%s reminder thread failed to start: %s", log_label, exc)
         return False
-    logger.info(
-        "Completion reminder queued for WhatsApp task after %.1fs",
-        elapsed_seconds,
-    )
+    logger.info(queued_log)
     return True
+
+
+def _send_completion_reminder(
+    *,
+    platform_name: str,
+    elapsed_seconds: float,
+    api_calls: int,
+    message_preview: str,
+    response_preview: str,
+) -> bool:
+    threshold = _completion_reminder_threshold_seconds()
+    if threshold is None or elapsed_seconds < threshold:
+        return False
+    if str(platform_name or "").lower() != _COMPLETION_REMINDER_PLATFORM:
+        return False
+
+    command = _build_completion_reminder_command(
+        elapsed_seconds=elapsed_seconds,
+        api_calls=api_calls,
+        message_preview=message_preview,
+        response_preview=response_preview,
+    )
+    return _queue_transient_reminder(
+        command=command,
+        thread_name="completion-reminder",
+        log_label="Completion",
+        created_log=f"Completion reminder created for WhatsApp task after {elapsed_seconds:.1f}s",
+        queued_log=f"Completion reminder queued for WhatsApp task after {elapsed_seconds:.1f}s",
+    )
+
+
+def _send_approval_reminder(
+    *,
+    platform_name: str,
+    command: str,
+    description: str,
+) -> bool:
+    if str(platform_name or "").lower() != _COMPLETION_REMINDER_PLATFORM:
+        return False
+    reminder_command = _build_approval_reminder_command(
+        command=command,
+        description=description,
+    )
+    return _queue_transient_reminder(
+        command=reminder_command,
+        thread_name="approval-reminder",
+        log_label="Approval",
+        created_log="Approval reminder created for WhatsApp command prompt",
+        queued_log="Approval reminder queued for WhatsApp command prompt",
+    )
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -16231,6 +16303,11 @@ class GatewayRunner:
                             raise RuntimeError("send_exec_approval: loop unavailable")
                         _approval_result = _approval_fut.result(timeout=15)
                         if _approval_result.success:
+                            _send_approval_reminder(
+                                platform_name=source.platform.value if source.platform else "",
+                                command=cmd,
+                                description=desc,
+                            )
                             return
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
@@ -16262,7 +16339,13 @@ class GatewayRunner:
                         log_message="Approval text-send scheduling error",
                     )
                     if _approval_send_fut is not None:
-                        _approval_send_fut.result(timeout=15)
+                        _approval_send_result = _approval_send_fut.result(timeout=15)
+                        if getattr(_approval_send_result, "success", False):
+                            _send_approval_reminder(
+                                platform_name=source.platform.value if source.platform else "",
+                                command=cmd,
+                                description=desc,
+                            )
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 

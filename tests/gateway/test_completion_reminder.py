@@ -46,6 +46,26 @@ def test_completion_reminder_command_targets_current_second():
     assert "The WhatsApp reply has been delivered." in command[command.index("--notes") + 1]
 
 
+def test_approval_reminder_command_reuses_transient_reminder_shape():
+    command = run._build_approval_reminder_command(
+        command="rm -rf build",
+        description="recursive delete",
+        now=datetime(2026, 5, 10, 12, 34, 20),
+    )
+
+    assert command[0].endswith("remindctl")
+    assert command[1:3] == ["add", "--title"]
+    assert "Goku needs command approval" in command
+    assert "--no-input" in command
+    assert "--json" in command
+    assert command[command.index("--due") + 1] == "2026-05-10 12:34:20"
+    assert command[command.index("--alarm") + 1] == "2026-05-10 12:34:20"
+    notes = command[command.index("--notes") + 1]
+    assert "The WhatsApp approval prompt has been delivered." in notes
+    assert "Reason: recursive delete" in notes
+    assert "Command: rm -rf build" in notes
+
+
 def test_completion_reminder_extracts_reminder_id():
     assert run._extract_reminder_id('{"id":"abc123","title":"done"}') == "abc123"
     assert run._extract_reminder_id('{"reminder":{"uuid":"rem-1"}}') == "rem-1"
