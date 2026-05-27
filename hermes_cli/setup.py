@@ -2248,28 +2248,6 @@ def _setup_webhooks():
     print_info("   Open config in your editor:  hermes config edit")
 
 
-# Platform registry for the gateway checklist
-_GATEWAY_PLATFORMS = [
-    ("Telegram", "TELEGRAM_BOT_TOKEN", _setup_telegram),
-    ("Discord", "DISCORD_BOT_TOKEN", _setup_discord),
-    ("Slack", "SLACK_BOT_TOKEN", _setup_slack),
-    ("Signal", "SIGNAL_HTTP_URL", _setup_signal),
-    ("Email", "EMAIL_ADDRESS", _setup_email),
-    ("SMS (Twilio)", "TWILIO_ACCOUNT_SID", _setup_sms),
-    ("Matrix", "MATRIX_ACCESS_TOKEN", _setup_matrix),
-    ("Mattermost", "MATTERMOST_TOKEN", _setup_mattermost),
-    ("WhatsApp", "WHATSAPP_ENABLED", _setup_whatsapp),
-    ("DingTalk", "DINGTALK_CLIENT_ID", _setup_dingtalk),
-    ("Feishu / Lark", "FEISHU_APP_ID", _setup_feishu),
-    ("Yuanbao", "YUANBAO_APP_ID", _setup_yuanbao),
-    ("WeCom (Enterprise WeChat)", "WECOM_BOT_ID", _setup_wecom),
-    ("WeCom Callback (Self-Built App)", "WECOM_CALLBACK_CORP_ID", _setup_wecom_callback),
-    ("Weixin (WeChat)", "WEIXIN_ACCOUNT_ID", _setup_weixin),
-    ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
-    ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
-]
-
-
 def setup_gateway(config: dict):
     """Configure messaging platform integrations."""
     from hermes_cli.gateway import _all_platforms, _platform_status, _configure_platform
