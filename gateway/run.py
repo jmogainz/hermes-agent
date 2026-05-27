@@ -679,6 +679,8 @@ _BROWSER_CLEANUP_AFTER_TURN_ENV = "HERMES_BROWSER_CLEANUP_AFTER_TURN"
 _BROWSER_CLEANUP_CDP_TABS_ENV = "HERMES_BROWSER_CLEANUP_NEW_CDP_TABS_AFTER_TURN"
 _COMPLETION_REMINDER_PLATFORM = "whatsapp"
 _REMINDCTL_FALLBACK_PATH = "/opt/homebrew/bin/remindctl"
+_TRANSIENT_REMINDERS_STATE_FILE = ".transient_reminders.json"
+_TRANSIENT_REMINDERS_LOCK = threading.Lock()
 _BROWSER_TOOL_PREFIXES = ("browser_", "mcp_chrome_devtools_", "mcp_chrome-devtools_")
 
 
@@ -780,6 +782,113 @@ def _build_completion_reminder_delete_command(remindctl_path: str, reminder_id: 
         "--no-input",
         "--json",
     ]
+
+
+def _transient_reminders_state_path() -> Path:
+    return _hermes_home / _TRANSIENT_REMINDERS_STATE_FILE
+
+
+def _load_transient_reminder_records() -> List[Dict[str, Any]]:
+    path = _transient_reminders_state_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Transient reminder state unreadable; resetting %s: %s", path, exc)
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict) and item.get("id")]
+
+
+def _write_transient_reminder_records(records: List[Dict[str, Any]]) -> None:
+    path = _transient_reminders_state_path()
+    if records:
+        atomic_json_write(path, records)
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except TypeError:  # Python < 3.8 compatibility for older test envs.
+            if path.exists():
+                path.unlink()
+
+
+def _record_transient_reminder(
+    *,
+    reminder_id: str,
+    remindctl_path: str,
+    log_label: str,
+) -> None:
+    """Persist a reminder id before sleeping so restarts can clean it up.
+
+    Cleanup used to live only in a daemon thread. A gateway restart between
+    ``remindctl add`` and the delayed ``remindctl delete`` killed that thread,
+    leaving temporary completion/approval reminders visible in Reminders.app.
+    """
+    record = {
+        "id": str(reminder_id),
+        "remindctl_path": str(remindctl_path or shutil.which("remindctl") or _REMINDCTL_FALLBACK_PATH),
+        "log_label": str(log_label or "Transient"),
+        "created_at": time.time(),
+    }
+    with _TRANSIENT_REMINDERS_LOCK:
+        records = [r for r in _load_transient_reminder_records() if str(r.get("id")) != str(reminder_id)]
+        records.append(record)
+        _write_transient_reminder_records(records)
+
+
+def _forget_transient_reminder(reminder_id: str) -> None:
+    with _TRANSIENT_REMINDERS_LOCK:
+        records = [r for r in _load_transient_reminder_records() if str(r.get("id")) != str(reminder_id)]
+        _write_transient_reminder_records(records)
+
+
+def _delete_transient_reminder_record(record: Dict[str, Any]) -> bool:
+    reminder_id = str(record.get("id") or "").strip()
+    if not reminder_id:
+        return True
+    remindctl_path = str(record.get("remindctl_path") or shutil.which("remindctl") or _REMINDCTL_FALLBACK_PATH)
+    label = str(record.get("log_label") or "Transient")
+    try:
+        result = subprocess.run(
+            _build_completion_reminder_delete_command(remindctl_path, reminder_id),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.warning("%s reminder recovery cleanup failed for %s: %s", label, reminder_id, exc)
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "%s reminder recovery cleanup failed for %s with exit %s: %s",
+            label,
+            reminder_id,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    logger.info("%s reminder recovery cleaned up stale reminder %s", label, reminder_id)
+    return True
+
+
+def _cleanup_recorded_transient_reminders() -> int:
+    """Best-effort startup cleanup for temporary reminders orphaned by restarts."""
+    with _TRANSIENT_REMINDERS_LOCK:
+        records = _load_transient_reminder_records()
+        if not records:
+            return 0
+        remaining: List[Dict[str, Any]] = []
+        cleaned = 0
+        for record in records:
+            if _delete_transient_reminder_record(record):
+                cleaned += 1
+            else:
+                remaining.append(record)
+        _write_transient_reminder_records(remaining)
+        return cleaned
 
 
 def _tool_name_from_call(value: Any) -> str:
@@ -1015,6 +1124,14 @@ def _queue_transient_reminder(
         if cleanup_after is None or not reminder_id:
             return
         try:
+            _record_transient_reminder(
+                reminder_id=reminder_id,
+                remindctl_path=remindctl_path,
+                log_label=log_label,
+            )
+        except Exception as exc:
+            logger.warning("%s reminder state record failed for %s: %s", log_label, reminder_id, exc)
+        try:
             time.sleep(cleanup_after)
             delete_result = subprocess.run(
                 _build_completion_reminder_delete_command(remindctl_path, reminder_id),
@@ -1034,6 +1151,7 @@ def _queue_transient_reminder(
                 (delete_result.stderr or delete_result.stdout or "").strip(),
             )
             return
+        _forget_transient_reminder(reminder_id)
         logger.info("%s reminder cleaned up after %.1fs", log_label, cleanup_after)
 
     try:
@@ -4402,6 +4520,12 @@ class GatewayRunner:
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+        try:
+            cleaned_reminders = _cleanup_recorded_transient_reminders()
+            if cleaned_reminders:
+                logger.info("Recovered %d stale transient reminder(s) from prior gateway process", cleaned_reminders)
+        except Exception as exc:
+            logger.warning("Transient reminder recovery cleanup failed: %s", exc)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running

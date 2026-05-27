@@ -1,4 +1,5 @@
 from datetime import datetime
+from unittest.mock import Mock
 
 from gateway import run
 
@@ -38,7 +39,7 @@ def test_completion_reminder_command_targets_current_second():
 
     assert command[0].endswith("remindctl")
     assert command[1:3] == ["add", "--title"]
-    assert "Goku finished your WhatsApp task (2m 5s)" in command
+    assert "Goku finished your WhatsApp task (2:05)" in command
     assert "--no-input" in command
     assert "--json" in command
     assert command[command.index("--due") + 1] == "2026-05-10 12:34:20"
@@ -81,6 +82,56 @@ def test_completion_reminder_delete_command():
         "--no-input",
         "--json",
     ]
+
+
+def test_transient_reminder_state_record_and_forget(monkeypatch, tmp_path):
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+
+    run._record_transient_reminder(
+        reminder_id="rem-1",
+        remindctl_path="/opt/homebrew/bin/remindctl",
+        log_label="Completion",
+    )
+
+    records = run._load_transient_reminder_records()
+    assert len(records) == 1
+    assert records[0]["id"] == "rem-1"
+    assert records[0]["remindctl_path"] == "/opt/homebrew/bin/remindctl"
+    assert records[0]["log_label"] == "Completion"
+
+    run._forget_transient_reminder("rem-1")
+
+    assert run._load_transient_reminder_records() == []
+    assert not run._transient_reminders_state_path().exists()
+
+
+def test_cleanup_recorded_transient_reminders_deletes_stale_records(monkeypatch, tmp_path):
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+    run._write_transient_reminder_records([
+        {"id": "rem-1", "remindctl_path": "/opt/homebrew/bin/remindctl", "log_label": "Completion"},
+        {"id": "rem-2", "remindctl_path": "/opt/homebrew/bin/remindctl", "log_label": "Approval"},
+    ])
+    subprocess_run = Mock(return_value=Mock(returncode=0, stdout='{}', stderr=''))
+    monkeypatch.setattr(run.subprocess, "run", subprocess_run)
+
+    assert run._cleanup_recorded_transient_reminders() == 2
+
+    assert run._load_transient_reminder_records() == []
+    assert subprocess_run.call_count == 2
+    assert subprocess_run.call_args_list[0].args[0][:3] == ["/opt/homebrew/bin/remindctl", "delete", "rem-1"]
+    assert subprocess_run.call_args_list[1].args[0][:3] == ["/opt/homebrew/bin/remindctl", "delete", "rem-2"]
+
+
+def test_cleanup_recorded_transient_reminders_keeps_failed_records(monkeypatch, tmp_path):
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+    run._write_transient_reminder_records([
+        {"id": "rem-1", "remindctl_path": "/opt/homebrew/bin/remindctl", "log_label": "Completion"},
+    ])
+    monkeypatch.setattr(run.subprocess, "run", Mock(return_value=Mock(returncode=1, stdout='', stderr='boom')))
+
+    assert run._cleanup_recorded_transient_reminders() == 0
+
+    assert [record["id"] for record in run._load_transient_reminder_records()] == ["rem-1"]
 
 
 def test_messages_used_browser_tool_detects_direct_and_mcp_calls():
