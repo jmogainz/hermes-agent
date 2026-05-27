@@ -10,11 +10,15 @@ import time
 import uuid
 import re
 from dataclasses import dataclass, fields, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import get_env_value, load_env
+from agent.credential_persistence import (
+    is_borrowed_credential_source,
+    sanitize_borrowed_credential_payload,
+)
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -86,7 +90,7 @@ CUSTOM_POOL_PREFIX = "custom:"
 _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
-    "agent_key_obtained_at", "tls",
+    "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
 })
 
 
@@ -161,7 +165,7 @@ class PooledCredential:
         for k, v in self.extra.items():
             if v is not None:
                 result[k] = v
-        return result
+        return sanitize_borrowed_credential_payload(result, self.provider)
 
     @property
     def runtime_api_key(self) -> str:
@@ -245,6 +249,16 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     sec_match = re.search(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", message, re.IGNORECASE)
     if sec_match:
         return float(sec_match.group(1))
+    # "Resets in 4hr 5min" format used by OpenCode Go weekly usage limits
+    hr_min_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\s+(\d+)\s*min", message, re.IGNORECASE)
+    if hr_min_match:
+        return int(hr_min_match.group(1)) * 3600 + int(hr_min_match.group(2)) * 60
+    hr_only_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\b", message, re.IGNORECASE)
+    if hr_only_match:
+        return int(hr_only_match.group(1)) * 3600
+    min_only_match = re.search(r"resets?\s+in\s+(\d+)\s*min\b", message, re.IGNORECASE)
+    if min_only_match:
+        return int(min_only_match.group(1)) * 60
     return None
 
 
@@ -797,6 +811,13 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
+                # Adopt fresher tokens from auth.json before spending the
+                # refresh_token — single-use tokens consumed by another Hermes
+                # process sharing the same auth.json singleton would otherwise
+                # trigger ``refresh_token_reused`` on the next POST.
+                synced = self._sync_codex_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
                 refreshed = auth_mod.refresh_codex_oauth_pure(
                     entry.access_token,
                     entry.refresh_token,
@@ -907,6 +928,116 @@ class CredentialPool:
                     self._replace_entry(synced, updated)
                     self._persist()
                     return updated
+                # Terminal error: auth.json has no newer tokens — the stored
+                # refresh_token is dead.  Clear it from auth.json so the next
+                # session does not re-seed the same revoked credentials, and
+                # remove all singleton-seeded (loopback_pkce) entries from the
+                # in-memory pool.  Mirrors the Nous quarantine path above.
+                if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
+                    logger.debug(
+                        "xAI OAuth refresh token is terminally invalid; clearing local token state"
+                    )
+                    try:
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            state = _load_provider_state(auth_store, "xai-oauth") or {}
+                            if isinstance(state, dict):
+                                tokens = state.get("tokens") or {}
+                                if isinstance(tokens, dict):
+                                    store_refresh = str(tokens.get("refresh_token") or "").strip()
+                                    entry_refresh = str(entry.refresh_token or "").strip()
+                                    if not store_refresh or store_refresh == entry_refresh:
+                                        tokens.pop("access_token", None)
+                                        tokens.pop("refresh_token", None)
+                                        state["tokens"] = tokens
+                                        state["last_auth_error"] = {
+                                            "provider": "xai-oauth",
+                                            "code": getattr(exc, "code", "unknown"),
+                                            "message": str(exc),
+                                            "reason": "credential_pool_refresh_failure",
+                                            "relogin_required": True,
+                                            "at": datetime.now(timezone.utc).isoformat(),
+                                        }
+                                        _save_provider_state(auth_store, "xai-oauth", state)
+                                        _save_auth_store(auth_store)
+                    except Exception as clear_exc:
+                        logger.debug(
+                            "Failed to clear terminal xAI OAuth state: %s", clear_exc
+                        )
+                    self._entries = [
+                        item for item in self._entries
+                        if item.source != "loopback_pkce"
+                    ]
+                    if self._current_id == entry.id:
+                        self._current_id = None
+                    self._persist()
+                    return None
+            # For openai-codex: same race as xAI/nous — another Hermes process
+            # may have consumed the refresh token between our proactive sync
+            # and the HTTP call.  Re-check auth.json and adopt the fresh tokens
+            # if they have rotated since.
+            if self.provider == "openai-codex":
+                synced = self._sync_codex_entry_from_auth_store(entry)
+                if synced.refresh_token != entry.refresh_token:
+                    logger.debug(
+                        "Codex OAuth refresh failed but auth.json has newer tokens — adopting"
+                    )
+                    updated = replace(
+                        synced,
+                        last_status=STATUS_OK,
+                        last_status_at=None,
+                        last_error_code=None,
+                        last_error_reason=None,
+                        last_error_message=None,
+                        last_error_reset_at=None,
+                    )
+                    self._replace_entry(synced, updated)
+                    self._persist()
+                    return updated
+                # Terminal error: auth.json has no newer tokens — the stored
+                # refresh_token is dead.  Clear it from auth.json so the next
+                # session does not re-seed the same revoked credentials, and
+                # remove all singleton-seeded (device_code) entries from the
+                # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
+                if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                    logger.debug(
+                        "Codex OAuth refresh token is terminally invalid; clearing local token state"
+                    )
+                    try:
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            state = _load_provider_state(auth_store, "openai-codex") or {}
+                            if isinstance(state, dict):
+                                tokens = state.get("tokens") or {}
+                                if isinstance(tokens, dict):
+                                    store_refresh = str(tokens.get("refresh_token") or "").strip()
+                                    entry_refresh = str(entry.refresh_token or "").strip()
+                                    if not store_refresh or store_refresh == entry_refresh:
+                                        tokens.pop("access_token", None)
+                                        tokens.pop("refresh_token", None)
+                                        state["tokens"] = tokens
+                                        state["last_auth_error"] = {
+                                            "provider": "openai-codex",
+                                            "code": getattr(exc, "code", "unknown"),
+                                            "message": str(exc),
+                                            "reason": "credential_pool_refresh_failure",
+                                            "relogin_required": True,
+                                            "at": datetime.now(timezone.utc).isoformat(),
+                                        }
+                                        _save_provider_state(auth_store, "openai-codex", state)
+                                        _save_auth_store(auth_store)
+                    except Exception as clear_exc:
+                        logger.debug(
+                            "Failed to clear terminal Codex OAuth state: %s", clear_exc
+                        )
+                    self._entries = [
+                        item for item in self._entries
+                        if item.source != "device_code"
+                    ]
+                    if self._current_id == entry.id:
+                        self._current_id = None
+                    self._persist()
+                    return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
             # auth.json and adopt the fresh tokens if available.
@@ -1144,9 +1275,21 @@ class CredentialPool:
         *,
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
+        api_key_hint: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
-            entry = self.current() or self._select_unlocked()
+            entry = None
+            if api_key_hint:
+                # Prefer the specific entry whose API key matches the one that
+                # actually failed.  When this pool was freshly loaded from disk
+                # (another process already rotated), current() is None and
+                # _select_unlocked() would return the NEXT key — the wrong one.
+                entry = next(
+                    (e for e in self._entries if e.runtime_api_key == api_key_hint),
+                    None,
+                )
+            if entry is None:
+                entry = self.current() or self._select_unlocked()
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
@@ -1316,8 +1459,12 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     if field_updates or extra_updates:
         if extra_updates:
             field_updates["extra"] = {**existing.extra, **extra_updates}
-        entries[existing_idx] = replace(existing, **field_updates)
-        return True
+        updated = replace(existing, **field_updates)
+        entries[existing_idx] = updated
+        # Runtime-only borrowed secret updates should refresh the in-memory
+        # entry without forcing auth.json churn when the disk-safe payload is
+        # unchanged (for example env keys with the same fingerprint).
+        return existing.to_dict() != updated.to_dict()
     return False
 
 
@@ -1379,6 +1526,48 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 return changed, active_sources
         except ImportError:
             pass
+
+        # API-key vs OAuth is a user-visible choice at `hermes setup` ("Claude
+        # Pro/Max subscription" vs "Anthropic API key").  The signal that the
+        # user picked the API-key path is: ANTHROPIC_API_KEY set in the env,
+        # AND no OAuth env vars set — `save_anthropic_api_key()` writes the
+        # API key and zeros ANTHROPIC_TOKEN; `save_anthropic_oauth_token()`
+        # does the inverse.  When that signal is present we MUST NOT seed
+        # autodiscovered OAuth tokens (~/.claude/.credentials.json from the
+        # Claude Code CLI, hermes_pkce creds from a previous OAuth login)
+        # into the anthropic pool — otherwise rotation on a 401/429 silently
+        # flips the session onto an OAuth credential, which forces the Claude
+        # Code identity injection, `mcp_` tool-name rewrite, and claude-cli
+        # User-Agent header (`agent/anthropic_adapter.py:2128`).  Users who
+        # explicitly opted into the API-key path are explicitly opting OUT of
+        # that masquerade.  Prefer ~/.hermes/.env over os.environ for the
+        # same reason `_seed_from_env` does — that's the authoritative file
+        # that `hermes setup` writes.
+        _env_file = load_env()
+
+        def _env_val(key: str) -> str:
+            return (_env_file.get(key) or os.environ.get(key) or "").strip()
+
+        anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
+        anthropic_oauth_env = (
+            _env_val("ANTHROPIC_TOKEN") or _env_val("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+        api_key_path_explicit = bool(anthropic_api_key and not anthropic_oauth_env)
+
+        if api_key_path_explicit:
+            # Prune any stale autodiscovered OAuth entries that may have been
+            # seeded into the on-disk pool during a previous OAuth session.
+            # Without this, switching OAuth -> API key at setup leaves the
+            # OAuth entries dormant in auth.json forever and rotation on a
+            # transient 401 could revive them.
+            retained = [
+                entry for entry in entries
+                if entry.source not in {"hermes_pkce", "claude_code"}
+            ]
+            if len(retained) != len(entries):
+                entries[:] = retained
+                changed = True
+            return changed, active_sources
 
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
@@ -1655,6 +1844,35 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     except ImportError:
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
+
+    def _secret_source_for_env(env_var: str) -> Optional[str]:
+        try:
+            from hermes_cli.env_loader import get_secret_source
+            source_label = get_secret_source(env_var)
+        except Exception:
+            source_label = None
+        return str(source_label).strip() if source_label else None
+
+    def _env_payload(
+        *,
+        source: str,
+        env_var: str,
+        token: str,
+        base_url: str,
+        auth_type: str = AUTH_TYPE_API_KEY,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "source": source,
+            "auth_type": auth_type,
+            "access_token": token,
+            "base_url": base_url,
+            "label": env_var,
+        }
+        secret_source = _secret_source_for_env(env_var)
+        if secret_source:
+            payload["secret_source"] = secret_source
+        return payload
+
     if provider == "openrouter":
         # Prefer ~/.hermes/.env over os.environ
         token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
@@ -1667,13 +1885,12 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
                 entries,
                 provider,
                 source,
-                {
-                    "source": source,
-                    "auth_type": AUTH_TYPE_API_KEY,
-                    "access_token": token,
-                    "base_url": OPENROUTER_BASE_URL,
-                    "label": "OPENROUTER_API_KEY",
-                },
+                _env_payload(
+                    source=source,
+                    env_var="OPENROUTER_API_KEY",
+                    token=token,
+                    base_url=OPENROUTER_BASE_URL,
+                ),
             )
         return changed, active_sources
 
@@ -1712,13 +1929,13 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             entries,
             provider,
             source,
-            {
-                "source": source,
-                "auth_type": auth_type,
-                "access_token": token,
-                "base_url": base_url,
-                "label": env_var,
-            },
+            _env_payload(
+                source=source,
+                env_var=env_var,
+                token=token,
+                base_url=base_url,
+                auth_type=auth_type,
+            ),
         )
     return changed, active_sources
 
@@ -1730,8 +1947,11 @@ def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources:
         if _is_manual_source(entry.source)
         or entry.source in active_sources
         or not (
-            entry.source.startswith("env:")
-            or entry.source in {"claude_code", "hermes_pkce"}
+            is_borrowed_credential_source(entry.source, entry.provider)
+            # Hermes PKCE is Hermes-owned/persistable while present, but it is
+            # still a file-backed singleton and should disappear from the pool
+            # when the backing OAuth file is gone.
+            or entry.source == "hermes_pkce"
         )
     ]
     if len(retained) == len(entries):
@@ -1816,17 +2036,22 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    raw_needs_sanitization = any(
+        isinstance(payload, dict)
+        and sanitize_borrowed_credential_payload(payload, provider) != payload
+        for payload in raw_entries
+    )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = custom_changed
+        changed = raw_needs_sanitization or custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
         env_changed, env_sources = _seed_from_env(provider, entries)
-        changed = singleton_changed or env_changed
+        changed = raw_needs_sanitization or singleton_changed or env_changed
         changed |= _prune_stale_seeded_entries(entries, singleton_sources | env_sources)
         changed |= _normalize_pool_priorities(provider, entries)
 
