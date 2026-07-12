@@ -1034,8 +1034,13 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".ini": "text/plain",
     ".cfg": "text/plain",
     ".zip": "application/zip",
+    ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+    ".ppt": "application/vnd.ms-powerpoint",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".ts": "text/plain",
     ".py": "text/plain",
@@ -2415,7 +2420,7 @@ class BasePlatformAdapter(ABC):
         # snippets (e.g. "- `MEDIA:/old/file.pdf`") or inline syntax examples as
         # attachments, because that can accidentally resend files mentioned while
         # debugging prior sessions.
-        media_exts = r"png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa"
+        media_exts = r"png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|xlsm|xlsb|pptx?|txt|csv|apk|ipa"
         media_pattern = re.compile(
             r'''(?m)^[ \t]*MEDIA:\s*(?P<path>`[^`\n]+\.(?:''' + media_exts + r''')`|"[^"\n]+\.(?:''' + media_exts + r''')"|'[^'\n]+\.(?:''' + media_exts + r''')'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:''' + media_exts + r''')(?=[\s`"',;:)\]}]|$))[ \t]*[`"']?''',
             re.IGNORECASE,
@@ -2470,7 +2475,7 @@ class BasePlatformAdapter(ABC):
             # Documents (uploaded as file attachments)
             '.pdf', '.docx', '.doc', '.odt', '.rtf', '.txt', '.md',
             # Spreadsheets / data
-            '.xlsx', '.xls', '.ods', '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml',
+            '.xlsx', '.xls', '.xlsm', '.xlsb', '.ods', '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml',
             # Presentations
             '.pptx', '.ppt', '.odp', '.key',
             # Archives
