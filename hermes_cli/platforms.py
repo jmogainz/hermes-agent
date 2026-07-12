@@ -24,6 +24,7 @@ PLATFORMS: OrderedDict[str, PlatformInfo] = OrderedDict([
     ("discord",        PlatformInfo(label="💬 Discord",         default_toolset="hermes-discord")),
     ("slack",          PlatformInfo(label="💼 Slack",           default_toolset="hermes-slack")),
     ("whatsapp",       PlatformInfo(label="📱 WhatsApp",        default_toolset="hermes-whatsapp")),
+    ("whatsapp_cloud", PlatformInfo(label="📱 WhatsApp Business (Cloud)", default_toolset="hermes-whatsapp")),
     ("signal",         PlatformInfo(label="📡 Signal",          default_toolset="hermes-signal")),
     ("email",          PlatformInfo(label="📧 Email",           default_toolset="hermes-email")),
     ("homeassistant",  PlatformInfo(label="🏠 Home Assistant",  default_toolset="hermes-homeassistant")),
