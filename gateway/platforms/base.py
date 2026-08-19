@@ -4875,17 +4875,14 @@ class BasePlatformAdapter(ABC):
             prefix = content[max(0, start - 20):start]
             if re.search(r'MEDIA:\s*$', prefix):
                 continue  # This is a MEDIA path quote, not inline code
-            # A whole tag wrapped in inline code (`MEDIA:/path.csv`) is a real
-            # delivery directive, not a prose example — models routinely format
-            # file paths as inline code. Deliver it IF the path validates
-            # (exists on disk, not denylisted). Prose examples with
-            # non-existent paths stay masked (#35695), and fenced code blocks
-            # are always masked regardless.
+            # A whole tag wrapped in inline code (`MEDIA:/path.csv`) is a
+            # quoted example or a session-history mention, not a delivery
+            # directive. Delivering it re-sends files from transcripts.
+            # Real attachments must be a standalone MEDIA: tag, not backticked.
             inner = m.group(0)[1:-1].strip()
             if inner.upper().startswith("MEDIA:"):
-                candidate = _normalize_media_tag_path(inner[6:])
-                if candidate and validate_media_delivery_path(candidate):
-                    continue  # Real deliverable tag in inline code — keep it scannable
+                spans.append((start, m.end()))
+                continue
             spans.append((start, m.end()))
 
         # Blockquote lines: > at line start
