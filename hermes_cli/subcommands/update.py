@@ -35,13 +35,13 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--no-backup",
         action="store_true",
         default=False,
-        help="Skip the pre-update backup for this run (overrides updates.pre_update_backup)",
+        help="Skip ALL pre-update backups for this run (both the quick state snapshot and the full zip; overrides updates.pre_update_backup)",
     )
     update_parser.add_argument(
         "--backup",
         action="store_true",
         default=False,
-        help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup=false)",
+        help="Force a FULL pre-update backup (quick state snapshot + HERMES_HOME zip) for this run, regardless of updates.pre_update_backup",
     )
     update_parser.add_argument(
         "--yes",
@@ -65,7 +65,7 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--force",
         action="store_true",
         default=False,
-        help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement. Does NOT bypass the venv-process guard (see --force-venv).",
+        help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings. Does NOT bypass the venv-process guard (see --force-venv).",
     )
     update_parser.add_argument(
         "--force-venv",

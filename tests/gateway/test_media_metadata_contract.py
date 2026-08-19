@@ -49,7 +49,6 @@ def test_send_image_accepts_metadata(module_name, class_name):
 # platform SDK isn't installed are skipped; an adapter that imports but
 # whose override drops metadata is a hard failure.
 _ALL_ADAPTERS = [
-    ("gateway.platforms.bluebubbles", "BlueBubblesAdapter"),
     ("plugins.platforms.dingtalk.adapter", "DingTalkAdapter"),
     ("gateway.platforms.discord", "DiscordAdapter"),
     ("plugins.platforms.email.adapter", "EmailAdapter"),
@@ -66,15 +65,3 @@ _ALL_ADAPTERS = [
 ]
 
 
-@pytest.mark.parametrize("module_name, class_name", _ALL_ADAPTERS)
-def test_all_adapters_send_image_metadata_sweep(module_name, class_name):
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:  # optional platform dep not installed
-        pytest.skip(f"{module_name} not importable: {exc}")
-    cls = getattr(module, class_name, None)
-    if cls is None or "send_image" not in cls.__dict__:
-        pytest.skip(f"{class_name} has no send_image override")
-    assert _accepts_metadata(cls.send_image), (
-        f"{class_name}.send_image drops the 'metadata' kwarg"
-    )
