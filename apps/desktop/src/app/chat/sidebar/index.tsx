@@ -126,6 +126,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
+import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
@@ -257,6 +258,16 @@ const HEADER_NAV_BTN =
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
 // by id; the snippet stands in for the preview).
+
+// The backend's FTS layer wraps matched terms in literal '>>>' / '<<<'
+// highlight markers (sqlite snippet() delimiters — see hermes_state_search.py).
+// The sidebar renders the snippet as plain text, so the markers must be
+// stripped or a search for "foo" paints rows titled ">>>foo<<<".
+// Exported for tests.
+export function stripFtsMarkers(snippet: string): string {
+  return snippet.replaceAll('>>>', '').replaceAll('<<<', '')
+}
+
 function searchResultToSession(result: SessionSearchResult): SessionInfo {
   const ts = result.session_started ?? Date.now() / 1000
 
@@ -272,7 +283,7 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
     message_count: 0,
     model: result.model ?? null,
     output_tokens: 0,
-    preview: result.snippet?.trim() || null,
+    preview: stripFtsMarkers(result.snippet ?? '').trim() || null,
     source: result.source ?? null,
     started_at: ts,
     title: null,
@@ -285,7 +296,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNavigate: (item: SidebarNavItem) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession: (sessionId: string) => void
@@ -360,6 +371,7 @@ export function ChatSidebar({
   const sortOrderIds = useStore($sidebarSessionRankIds)
   const agentsGrouped = grouping === 'project'
   const pinnedSessionIds = useStore($pinnedSessionIds)
+  const unconfirmedPinWrites = useStore($unconfirmedPinWrites)
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
@@ -551,15 +563,17 @@ export function ChatSidebar({
 
   // Local pin ids first (hand-picked order), then server-flagged pins the
   // local set doesn't know about — a backend `pinned=1` row must never be
-  // invisible just because localStorage is cold or was clobbered (#85969).
+  // invisible just because localStorage is cold or was clobbered (#85969) —
+  // minus the rows whose flag our own in-flight pin write already contradicts.
   const pinnedSessions = useMemo(
     () =>
-      resolvePinnedSessions(pinnedSessionIds, sessionByAnyId, [
-        ...visibleSessions,
-        ...cronSessions,
-        ...messagingSessions
-      ]),
-    [pinnedSessionIds, sessionByAnyId, visibleSessions, cronSessions, messagingSessions]
+      resolvePinnedSessions(
+        pinnedSessionIds,
+        sessionByAnyId,
+        [...visibleSessions, ...cronSessions, ...messagingSessions],
+        unconfirmedPinWrites
+      ),
+    [pinnedSessionIds, sessionByAnyId, visibleSessions, cronSessions, messagingSessions, unconfirmedPinWrites]
   )
 
   // Every id a pin is reachable under: the raw stored ids, plus BOTH identities
@@ -1451,6 +1465,8 @@ export function ChatSidebar({
         'border-(--sidebar-edge-border) bg-(--ui-sidebar-surface-background) opacity-100'
       )}
       collapsible="none"
+      data-tip-region=""
+      data-tour="sessions-sidebar"
     >
       <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
         <SidebarGroup className="shrink-0 p-0 pb-2 pt-[calc(var(--titlebar-height)+0.375rem)]">
@@ -1486,6 +1502,9 @@ export function ChatSidebar({
                       !isInteractive &&
                         'cursor-default hover:border-transparent hover:bg-transparent hover:text-inherit'
                     )}
+                    // A tip anchored to the label points at the end of the
+                    // word; the row is what it's actually about.
+                    data-tip-region=""
                     onClick={() => {
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
@@ -1509,7 +1528,18 @@ export function ChatSidebar({
                     type="button"
                   >
                     <item.icon className="size-4 shrink-0 text-[color-mix(in_srgb,currentColor_72%,transparent)]" />
-                    <span className="min-w-0 flex-1 truncate">{s.nav[item.id] ?? item.label}</span>
+                    {/* Shrink-to-fit, not flex-1: the label carries the row's
+                        `data-tour` handle, and anything anchored to it should
+                        land at the end of the WORD, not out at the sidebar's
+                        edge. Still truncates — `min-w-0` lets it shrink past
+                        its content when the rail is narrow — and the trailing
+                        chip's `ml-auto` was already doing the pushing that
+                        `flex-1` looked like it was for.
+                        Its own `sidebar-nav-` namespace: the overlay nav owns
+                        `nav-<id>`, and both are on screen with Settings open. */}
+                    <span className="min-w-0 truncate" data-tip-arrow-only="" data-tour={`sidebar-nav-${item.id}`}>
+                      {s.nav[item.id] ?? item.label}
+                    </span>
                     {isNewSession && (
                       <KbdGroup
                         className={cn('ml-auto opacity-55', newSessionKbdFlash && 'opacity-100!')}
