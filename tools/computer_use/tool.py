@@ -341,6 +341,61 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
             pass
 
 
+def call_cua_read_only_tool(
+    name: str,
+    args: Dict[str, Any],
+    *,
+    session_id: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    """Call one explicitly allowlisted, read-only Cua MCP tool.
+
+    Computer History uses this seam so it shares the same backend, immutable
+    permission mode, lifecycle, and per-Hermes-session lock as desktop actions.
+    It never exposes the generic arbitrary-tool call surface to the model.
+    """
+    allowed = {"history_status", "history_query"}
+    if name not in allowed or not isinstance(args, dict):
+        return {
+            "isError": True,
+            "structuredContent": {"code": "history_preview_not_admitted"},
+        }
+    sid = str(session_id or "")
+    try:
+        backend = _get_backend(sid)
+    except Exception:
+        return {
+            "isError": True,
+            "structuredContent": {"code": "history_storage_unavailable"},
+        }
+    has_tool = getattr(backend, "_has_tool", None)
+    if (
+        callable(has_tool)
+        and bool(getattr(backend, "capabilities_discovered", False))
+        and not has_tool(name)
+    ):
+        return {
+            "isError": True,
+            "structuredContent": {"code": "history_preview_not_admitted"},
+        }
+    call = getattr(backend, "call_tool", None)
+    if not callable(call):
+        return {
+            "isError": True,
+            "structuredContent": {"code": "history_storage_unavailable"},
+        }
+    with _backend_lock:
+        call_lock = _backend_call_locks.setdefault(sid, threading.RLock())
+    with call_lock:
+        try:
+            return call(name, args, timeout=float(timeout))
+        except Exception:
+            return {
+                "isError": True,
+                "structuredContent": {"code": "history_storage_unavailable"},
+            }
+
+
 def release_computer_use_session(session_id: str) -> bool:
     """Release one session-owned computer-use backend.
 

@@ -406,6 +406,12 @@ def _finalize(
     if sniffed is not None:
         if "image" not in permitted:
             raise NotAnImage("source is an image, but this argument takes a video", src=src, origin=origin)
+        if sniffed == "image/heif":
+            from tools.vision_tools import transcode_heif_to_png
+
+            png = transcode_heif_to_png(data)
+            if png:
+                return ResolvedImage(data=png, mime="image/png", origin=origin)
         return ResolvedImage(data=data, mime=sniffed, origin=origin)
 
     if "image" in permitted and b"<svg" in data[:4096].lower():

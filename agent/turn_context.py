@@ -1443,6 +1443,28 @@ def build_turn_context(
             except Exception:
                 pass
 
+    # Deterministic Cua Computer History consultation.  This is deliberately
+    # host-side rather than a prompt-only instruction: for explicit
+    # continuation/recent-work requests, status is checked first and one
+    # bounded metadata-only query is hydrated before broader desktop/model
+    # discovery.  The helper no-ops when the preview tools are absent,
+    # denied, unhealthy, or not present in this session's tool surface.
+    try:
+        from agent.computer_history import computer_history_context_for_agent
+
+        _history_context = computer_history_context_for_agent(
+            agent,
+            original_user_message,
+        )
+        if _history_context:
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _history_context
+                if plugin_user_context
+                else _history_context
+            )
+    except Exception:
+        logger.debug("Computer History continuation preflight skipped", exc_info=True)
+
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
     # turn's user message, never into the stored content — so on the next

@@ -35,6 +35,7 @@ from gateway.platforms.api_server import (
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
+    _request_reasoning_config,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -147,9 +148,14 @@ class TestIdempotencyCache:
         assert first_result == second_result == ("response", {"total_tokens": 1})
 
 
-# ---------------------------------------------------------------------------
-# Adapter initialization
-# ---------------------------------------------------------------------------
+class TestReasoningRequestParsing:
+    def test_accepts_max_and_ultra_effort_values(self):
+        assert _request_reasoning_config(
+            {"reasoning": {"enabled": True, "effort": "max"}}
+        ) == {"enabled": True, "effort": "max"}
+        assert _request_reasoning_config(
+            {"reasoning_effort": "ultra"}
+        ) == {"enabled": True, "effort": "ultra"}
 
 
 class TestAdapterInit:

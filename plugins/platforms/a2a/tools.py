@@ -165,13 +165,14 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
-    # v1.0: contextId lives inside the Message, not at the params top level.
+    parts = [protocol.text_part(safe_message)]
+    parts.extend(protocol.file_parts_from_text(message or ""))
     rpc_body = {
         "jsonrpc": "2.0",
         "id": protocol.new_task_id(),
         "method": "SendMessage",
         "params": {
-            "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
+            "message": protocol.message_with_parts(protocol.ROLE_USER, parts, context_id=ctx),
         },
     }
 

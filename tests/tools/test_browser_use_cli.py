@@ -13,6 +13,7 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
+import shlex
 import stat
 import time
 
@@ -835,6 +836,12 @@ class TestSkillTextDescription:
                        "click_at_xy(", "capture_screenshot()", "cdp("):
             assert helper in bu_cli._HELPERS_DIGEST
 
+    def test_digest_routes_auth_walls_to_native_component_request(self):
+        assert "<semreh.native-component>" in bu_cli._HELPERS_DIGEST
+        assert "website_login" not in bu_cli._HELPERS_DIGEST
+        assert "never" in bu_cli._HELPERS_DIGEST.lower()
+        assert "credential" in bu_cli._HELPERS_DIGEST.lower()
+
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
         assert bu_cli._HELPERS_DIGEST in desc
@@ -1092,3 +1099,282 @@ class TestDefaultDowngradeNotice:
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.default_downgrade_notice() is None
+def test_model_browser_exec_is_blocked_during_pending_native_auth(monkeypatch):
+    from tools.native_auth_runtime import native_auth_runtime
+
+    native_auth_runtime.create_context(
+        task_id="guard-task-1",
+        browser_session_key="guard-browser-1",
+        browser_session_id="guard-browser-1",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_guard_password_12345678"},
+        }],
+        actions=[{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "css", "value": "button[type=submit]", "target_id": "ref_guard_submit_12345678"},
+        }],
+        browser_backend="browser-use",
+    )
+    result = json.loads(bu_cli.browser_exec(
+        'fill_input("input[type=password]", "should-not-run")',
+        task_id="guard-task-1",
+    ))
+    assert "auth_boundary_required" in result["error"]
+
+
+def test_builtin_browser_type_is_blocked_for_reserved_auth_ref(monkeypatch):
+    import tools.browser_tool as browser_tool
+    from tools.native_auth_runtime import native_auth_runtime
+
+    native_auth_runtime.create_context(
+        task_id="guard-task-2",
+        browser_session_key="guard-browser-2",
+        browser_session_id="guard-browser-2",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "ref", "value": "@e1"},
+        }],
+        actions=[{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "ref", "value": "@e2"},
+        }],
+        browser_backend="fake",
+    )
+    monkeypatch.setattr(browser_tool, "_blocked_private_page_action", lambda *args: None)
+    monkeypatch.setattr(browser_tool, "_run_browser_command", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("browser command must not run")))
+    result = json.loads(browser_tool.browser_type("@e1", "should-not-run", task_id="guard-task-2"))
+    assert result["success"] is False
+    assert result["auth_boundary_required"] is True
+
+
+def test_validate_native_target_accepts_bounded_locator_strategies_and_rejects_code():
+    from tools.browser_use_cli import validate_native_target
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    for target in (
+        {"strategy": "css", "value": "form input[type=password]"},
+        {"strategy": "xpath", "value": "//input[@autocomplete='current-password']"},
+        {"strategy": "role", "value": "textbox:Password"},
+        {"strategy": "label", "value": "Password"},
+    ):
+        validate_native_target(target)
+
+    with pytest.raises(NativeAuthSecurityError):
+        validate_native_target({"strategy": "css", "value": "javascript:alert(1)"})
+    with pytest.raises(NativeAuthSecurityError):
+        validate_native_target({"strategy": "css", "value": "<script>evil</script>"})
+
+
+def test_default_browser_use_fill_uses_private_session_binding(monkeypatch):
+    from tools.native_auth_runtime import NativeAuthRuntime
+    import tools.browser_use_cli as browser_use_cli
+
+    runtime = NativeAuthRuntime()
+    public = runtime.create_context(
+        task_id="session-123",
+        browser_session_key="browser-key-123",
+        browser_session_id="browser-session-123",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_fill_password_12345678"},
+        }],
+        actions=[],
+        browser_backend="browser-use",
+        browser_session_name="named-auth-session",
+    )
+    internal = runtime._contexts[public["context_id"]]
+    field = internal.public["fields"][0]
+    captured = {}
+
+    def fake_fill(**kwargs):
+        captured.update(kwargs)
+        return {"state": "filled"}
+
+    monkeypatch.setattr(browser_use_cli, "secure_native_fill", fake_fill)
+    result = runtime._default_fill_executor(
+        context=internal.public,
+        field=field,
+        plaintext="synthetic-value",
+    )
+
+    assert result["state"] == "filled"
+    assert captured["session"] == "named-auth-session"
+    assert captured["expected_origin"] == "https://accounts.example.test"
+    assert captured["expected_path"] == "/login"
+    assert captured["plaintext"] == "synthetic-value"
+
+
+def test_secure_native_preflight_returns_only_opaque_ack(monkeypatch):
+    import tools.browser_use_cli as browser_use_cli
+
+    captured = {}
+
+    def fake_exec(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "output": "HERMES_NATIVE_AUTH_PREFLIGHT_OK"}
+
+    monkeypatch.setattr(browser_use_cli, "browser_exec", fake_exec)
+    result = browser_use_cli.secure_native_preflight(
+        session="named-auth-session",
+        target={"strategy": "css", "value": "input[type=password]", "target_id": "ref_12345678"},
+        expected_origin="https://accounts.example.test",
+        expected_path="/login",
+        expected_tab_handle="tab_12345678",
+        expected_frame_handle="frame_12345678",
+        expected_document_generation="doc_12345678",
+    )
+
+    assert result == {"state": "validated"}
+    assert captured["session"] == "named-auth-session"
+    assert "accounts.example.test" in captured["code"]
+    assert "/login" in captured["code"]
+    assert "input[type=password]" in captured["code"]
+    assert "ref_12345678" in captured["code"]
+    assert "tab_12345678" in captured["code"]
+    assert "frame_12345678" in captured["code"]
+    assert "doc_12345678" in captured["code"]
+    assert "HERMES_NATIVE_AUTH_PREFLIGHT_OK" in captured["code"]
+    assert "synthetic-value" not in captured["code"]
+
+
+def test_secure_native_preflight_fails_closed_without_ack(monkeypatch):
+    import tools.browser_use_cli as browser_use_cli
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    monkeypatch.setattr(browser_use_cli, "browser_exec", lambda **_: {"success": True, "output": ""})
+    with pytest.raises(NativeAuthSecurityError, match="preflight"):
+        browser_use_cli.secure_native_preflight(
+            session="named-auth-session",
+            target={"strategy": "css", "value": "input[type=password]"},
+            expected_origin="https://accounts.example.test",
+            expected_path="/login",
+        )
+def test_secure_native_fill_sends_plaintext_only_in_browser_stdin(tmp_path, monkeypatch):
+    """The internal browser-use invocation must not put plaintext in argv."""
+    capture = tmp_path / "capture"
+    cli = tmp_path / "browser-use"
+    cli.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" > {capture}.args\n"
+        f"cat > {capture}.stdin\n"
+        "printf '%s' '{\"success\":true,\"output\":\"HERMES_NATIVE_AUTH_FILLED\"}'"
+    )
+    cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [str(cli)])
+    monkeypatch.setattr(bu_cli, "_base_subprocess_env", lambda: {"PATH": os.environ.get("PATH", "")})
+    monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id, session_name=None: None)
+    monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: None)
+
+    from tools.browser_use_cli import secure_native_fill
+
+    secret = "synthetic-secret-not-an-argv"
+    result = secure_native_fill(
+        session="auth-test",
+        target={"strategy": "css", "value": "form input[type=password]"},
+        plaintext=secret,
+    )
+
+    assert result["state"] == "filled"
+    assert secret in capture.with_suffix(".stdin").read_text()
+    assert secret not in capture.with_suffix(".args").read_text()
+    assert secret not in json.dumps(result)
+
+
+def test_extract_native_auth_probe_output_strips_marker_and_returns_metadata():
+    payload = {
+        "origin": "https://example.com",
+        "path": "/login",
+        "title": "Sign in",
+        "fields": [
+            {
+                "field_id": "field_1",
+                "kind": "password",
+                "label": "Password",
+                "required": True,
+                "target": {"strategy": "css", "value": "form input[type=password]"},
+            }
+        ],
+        "actions": [],
+    }
+    output = "ordinary output\n" + bu_cli._NATIVE_AUTH_CONTEXT_PREFIX + json.dumps(payload) + "\n"
+    clean, extracted = bu_cli._extract_native_auth_probe_output(output)
+    assert clean == "ordinary output"
+    assert extracted == payload
+
+
+def test_browser_exec_returns_wire_auth_context_from_browser_probe(tmp_path, monkeypatch):
+    probe_payload = {
+        "origin": "https://accounts.example.test",
+        "path": "/login",
+        "title": "Sign in",
+        "document_generation": "doc_12345678",
+        "tab_handle": "tab_12345678",
+        "frame_handle": "frame_12345678",
+        "fields": [{
+            "field_id": "field_1",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_12345678"},
+        }],
+        "actions": [{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "css", "value": "button[type=submit]", "target_id": "ref_probe_submit_12345678"},
+        }],
+        "signals": "Sign in password",
+    }
+    body = (
+        "printf '%s%s\n' 'HERMES_NATIVE_AUTH_PROBE_STATUS:ok' ''; "
+        "printf '%s%s\n' 'HERMES_NATIVE_AUTH_CONTEXT:' "
+        + shlex.quote(json.dumps(probe_payload, separators=(",", ":")))
+        + "\n"
+    )
+    cli = _fake_cli(tmp_path, body)
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+    monkeypatch.setattr(bu_cli, "_base_subprocess_env", lambda: {"PATH": os.environ.get("PATH", "")})
+    monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id, session_name=None: None)
+    monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: None)
+    monkeypatch.setattr(bu_cli, "is_legacy_browser_use_cloud_config", lambda _: False)
+
+    result = json.loads(bu_cli.browser_exec(
+        "print('browser work')",
+        session="auth-probe-test",
+        task_id="auth-probe-task",
+    ))
+    assert result["success"] is True, result
+    auth_context = result["auth_context"]
+    assert auth_context["type"] == "hermes.auth-context.v1"
+    assert auth_context["provider_origin"] == "https://accounts.example.test"
+    assert auth_context["component_ids"]
+    from tools.native_auth_runtime import native_auth_runtime
+    internal = native_auth_runtime._contexts[auth_context["context_id"]]
+    assert internal.public["document_generation"] == "doc_12345678"
+    assert internal.public["tab_handle"] == "tab_12345678"
+    assert internal.public["frame_handle"] == "frame_12345678"
+    assert internal.public["fields"][0]["target"]["target_id"] == "ref_12345678"
+    assert "input[type=password]" not in json.dumps(auth_context)

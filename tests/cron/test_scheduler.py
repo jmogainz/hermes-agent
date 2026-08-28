@@ -198,6 +198,24 @@ class TestResolveDeliveryTarget:
         }
 
 
+    def test_webui_origin_resolves_to_direct_session_mirror(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "webui",
+                "chat_id": "webui-session-123",
+                "thread_id": None,
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "webui",
+            "chat_id": "webui-session-123",
+            "thread_id": None,
+            "_webui_session_id": "webui-session-123",
+        }
+
+
     def test_bare_platform_delivery_uses_home_root_instead_of_origin_thread(self, monkeypatch):
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "home-parent")
         monkeypatch.delenv("DISCORD_HOME_CHANNEL_THREAD_ID", raising=False)

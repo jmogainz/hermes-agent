@@ -112,6 +112,39 @@ def mirror_to_session(
         return False
 
 
+def mirror_to_session_id(
+    session_id: str,
+    message_text: str,
+    source_label: str = "cli",
+    role: str = "user",
+) -> bool:
+    """Append a mirror directly to an already-known Hermes session ID.
+
+    WebUI/API sessions are keyed by their session ID and do not have a gateway
+    platform origin/chat pair. Cron jobs created from WebUI therefore use this
+    path instead of pretending ``webui`` is a messaging adapter.
+    """
+    try:
+        if not str(session_id).strip() or not (message_text or "").strip():
+            return False
+        if not _append_to_sqlite(
+            str(session_id),
+            {
+                "role": role,
+                "content": message_text,
+                "timestamp": datetime.now().isoformat(),
+                "mirror": True,
+                "mirror_source": source_label,
+            },
+        ):
+            return False
+        logger.info("Mirror: wrote directly to session %s (from %s)", session_id, source_label)
+        return True
+    except Exception as e:
+        logger.debug("Direct session mirror failed for %s: %s", session_id, e)
+        return False
+
+
 def _find_session_id(
     platform: str,
     chat_id: str,
@@ -207,7 +240,7 @@ def _find_session_id(
 
 
 
-def _append_to_sqlite(session_id: str, message: dict) -> None:
+def _append_to_sqlite(session_id: str, message: dict) -> bool:
     """Append a message to the SQLite session database."""
     db = None
     try:
@@ -218,8 +251,10 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
             role=message.get("role", "assistant"),
             content=message.get("content"),
         )
+        return True
     except Exception as e:
         logger.debug("Mirror SQLite write failed: %s", e)
+        return False
     finally:
         if db is not None:
             db.close()

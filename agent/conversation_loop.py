@@ -6835,6 +6835,64 @@ def run_conversation(
             except Exception:
                 pass
 
+            _native_component_handler = getattr(agent, "handle_native_component_response", None)
+            native_component_result = (
+                _native_component_handler(assistant_message.content or "")
+                if callable(_native_component_handler)
+                else None
+            )
+            if native_component_result is not None:
+                if native_component_result.get("valid"):
+                    safe_component_text = (
+                        native_component_result.get("clean_text") or "Sign-in required in Semreh."
+                    ).strip()
+                    assistant_message.content = safe_component_text
+                    if callable(getattr(agent, "native_component_callback", None)):
+                        # Persist only a safe narration plus an opaque status
+                        # message. The actual component metadata travels through
+                        # the native callback/SSE path; credential values never
+                        # enter this message list.
+                        native_assistant_message = agent._build_assistant_message(
+                            assistant_message, finish_reason
+                        )
+                        native_assistant_message["content"] = safe_component_text
+                        native_assistant_message["_native_component"] = True
+                        append_message(messages, native_assistant_message)
+                        component = native_component_result.get("component") or {}
+                        component_id = component.get("component_id")
+                        if not isinstance(component_id, str) or not component_id:
+                            native_component_result = {
+                                "handled": True,
+                                "valid": False,
+                                "clean_text": "",
+                                "component": None,
+                            }
+                        else:
+                            native_state = agent.wait_for_native_component(component_id)
+                            append_message(
+                                messages,
+                                {
+                                    "role": "user",
+                                    "content": json.dumps(
+                                        {
+                                            "type": "native_auth_state",
+                                            "component_id": component_id,
+                                            "state": native_state.get("state", "failed"),
+                                            "field_ids": native_state.get("field_ids", []),
+                                            "action_id": native_state.get("action_id"),
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                },
+                            )
+                            agent._session_messages = messages
+                            continue
+                if not native_component_result.get("valid"):
+                    assistant_message.content = (
+                        native_component_result.get("clean_text")
+                        or "The native sign-in component could not be created safely."
+                    ).strip()
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:

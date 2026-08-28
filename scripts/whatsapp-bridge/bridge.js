@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser, Browsers } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -393,7 +393,13 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+const getWAVersion = createVersionResolver(async () => {
+  try {
+    return await fetchLatestWaWebVersion();
+  } catch {
+    return await fetchLatestBaileysVersion();
+  }
+});
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -404,9 +410,11 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Goku', 'Chrome', '120.0'],
+    // Real browser fingerprint — custom ['Goku','Chrome',...] is associated with WA 405 rejections
+    browser: Browsers.macOS('Chrome'),
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    connectTimeoutMs: 60_000,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {

@@ -66,6 +66,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Native auth is emitted by the browser runtime as a component event; the
+    # deprecated explicit website_login tool is intentionally not model-visible.
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -85,6 +87,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Cua Driver Computer History (gated on the daemon advertising the
+    # permission-controlled preview tools; capture remains user-controlled).
+    "history_status", "history_query",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -106,6 +111,11 @@ TOOLSETS = {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
         "includes": []  # No other toolsets included
+    },
+    "work_mode": {
+        "description": "Native auth is delivered as a secure component by the active browser runtime",
+        "tools": [],
+        "includes": [],
     },
     
     "search": {
@@ -163,7 +173,16 @@ TOOLSETS = {
             "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the "
             "user's cursor or keyboard focus. Works with any tool-capable model."
         ),
-        "tools": ["computer_use"],
+        "tools": ["computer_use", "history_status", "history_query"],
+        "includes": []
+    },
+
+    "computer_history": {
+        "description": (
+            "Permission-gated, encrypted, metadata-only Cua Driver Computer "
+            "History reads for continuation and recent-work context"
+        ),
+        "tools": ["history_status", "history_query"],
         "includes": []
     },
 

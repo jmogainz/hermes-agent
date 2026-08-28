@@ -18,6 +18,8 @@ from pathlib import Path
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from cron.scheduler import _cron_inactivity_seconds
+
 
 class FakeAgent:
     """Mock agent with controllable activity summary for timeout tests."""
@@ -184,6 +186,29 @@ class TestInactivityTimeout:
 
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         assert _cron_inactivity_limit == 1200.0
+
+    def test_job_override_takes_precedence_over_process_environment(self, monkeypatch):
+        """A long-running job can opt out without disabling other cron guards."""
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "15")
+
+        assert _cron_inactivity_seconds({
+            "id": "equity-reversion",
+            "inactivity_timeout_seconds": 0,
+        }) == 0.0
+        assert _cron_inactivity_seconds({
+            "id": "bounded-job",
+            "inactivity_timeout_seconds": 45,
+        }) == 45.0
+        # Jobs without the override retain the process-level watchdog.
+        assert _cron_inactivity_seconds({"id": "ordinary-job"}) == 15.0
+
+    def test_invalid_job_override_fails_closed_to_default(self, monkeypatch):
+        """A malformed per-job value must not accidentally become unlimited."""
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        assert _cron_inactivity_seconds({
+            "id": "bad-job",
+            "inactivity_timeout_seconds": "not-a-number",
+        }) == 600.0
 
 
     def test_agent_without_activity_summary_uses_wallclock_fallback(self):

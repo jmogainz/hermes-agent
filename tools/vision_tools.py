@@ -260,6 +260,45 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
         return "image/bmp"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
+    if _is_heif_bytes(data):
+        return "image/heif"
+    return None
+
+
+_HEIF_BRANDS = {b"heic", b"heix", b"heif", b"mif1", b"msf1", b"hevc", b"hevx"}
+
+
+def _is_heif_bytes(data: bytes) -> bool:
+    """True for ISO-BMFF HEIF/HEIC, including iPhone shots saved as .jpg."""
+    return len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _HEIF_BRANDS
+
+
+def transcode_heif_to_png(data: bytes) -> Optional[bytes]:
+    """Rasterize HEIF/HEIC to PNG. Returns None if no local transcoder works."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not data or not _is_heif_bytes(data):
+        return None
+    sips = shutil.which("sips")
+    if not sips:
+        return None
+    with tempfile.TemporaryDirectory(prefix="heif-") as tmp:
+        src = Path(tmp) / "in.heic"
+        dest = Path(tmp) / "out.png"
+        src.write_bytes(data)
+        try:
+            subprocess.run(
+                [sips, "-s", "format", "png", str(src), "--out", str(dest)],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if dest.is_file() and dest.stat().st_size > 0:
+            return dest.read_bytes()
     return None
 
 
@@ -356,6 +395,21 @@ def _normalize_to_supported_image(
             "inkscape). Convert the SVG to PNG first — e.g. open it in a browser "
             "and screenshot it, or install a rasterizer "
             "(`pip install cairosvg`) — then re-run vision_analyze on the PNG.",
+        )
+
+    # iPhone/WebUI HEIF often arrives as .jpg. Pillow cannot read it.
+    raw = image_path.read_bytes()
+    if detected_mime in {"image/heif", "image/heic"} or _is_heif_bytes(raw):
+        png = transcode_heif_to_png(raw)
+        if png:
+            out_path.write_bytes(png)
+            return out_path, "image/png", None
+        return (
+            None,
+            None,
+            "This is a HEIF/HEIC image (common for iPhone screenshots even when "
+            "the file is named .jpg). Convert it with `sips -s format png` and "
+            "re-run vision_analyze on the PNG.",
         )
 
     # Other non-supported raster formats (BMP, TIFF, ...): re-encode via Pillow.

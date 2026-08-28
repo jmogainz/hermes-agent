@@ -1417,21 +1417,33 @@ _CWD_LOCK_TIMEOUT_FLOOR_SECONDS = 120.0
 _CWD_LOCK_TIMEOUT_MARGIN_SECONDS = 60.0
 
 
-def _cron_inactivity_seconds() -> float:
-    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600.
+def _cron_inactivity_seconds(job: Optional[dict] = None) -> float:
+    """Parse the inactivity limit for a cron job.
 
-    Shared by run_job's inactivity monitor (which maps 0 to "no limit") and
-    the cwd-lock bound below (which keeps the wait bounded regardless) so
-    the two sites cannot drift apart — the lock bound must stay at or above
-    the inactivity limit or waiters would fail while a healthy holder runs.
+    ``0`` means unlimited.  A job-level ``inactivity_timeout_seconds`` value
+    takes precedence over ``HERMES_CRON_TIMEOUT`` so a deliberately long model
+    job can opt out without weakening the watchdog for every other cron job.
+    Missing or malformed values retain the defensive 600-second default.
+
+    This is an *inactivity* guard, never a wall-clock budget: an active job may
+    run for any duration.  The one-shot claim heartbeat and explicit agent/
+    artifact failure handling remain active when the limit is unlimited.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    if not raw:
+    source = "HERMES_CRON_TIMEOUT"
+    raw: Any = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    if isinstance(job, dict) and "inactivity_timeout_seconds" in job:
+        source = f"job {job.get('id', '<unknown>')} inactivity_timeout_seconds"
+        raw = job.get("inactivity_timeout_seconds")
+
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 600.0
+    if isinstance(raw, bool):
+        logger.warning("Invalid %s=%r; using default 600s", source, raw)
         return 600.0
     try:
         return float(raw)
     except (ValueError, TypeError):
-        logger.warning("Invalid HERMES_CRON_TIMEOUT=%r; using default 600s", raw)
+        logger.warning("Invalid %s=%r; using default 600s", source, raw)
         return 600.0
 
 
@@ -2511,6 +2523,13 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
+            if str(origin.get("platform") or "").lower() == "webui":
+                return {
+                    "platform": "webui",
+                    "chat_id": str(origin["chat_id"]),
+                    "thread_id": origin.get("thread_id"),
+                    "_webui_session_id": str(origin["chat_id"]),
+                }
             return {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
@@ -3139,6 +3158,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     apply_media_policy_env(user_cfg)
 
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+
+    # WebUI/API sessions are not messaging adapters. A deliver=origin job
+    # created in WebUI stores the exact UI session id as origin.chat_id; mirror
+    # directly into that session instead of routing through Platform("webui").
+    webui_targets = [target for target in targets if target.get("_webui_session_id")]
+    if webui_targets:
+        from gateway.mirror import mirror_to_session_id
+
+        webui_text = (cleaned_delivery_content or "").strip()
+        webui_errors = []
+        for target in webui_targets:
+            ok = mirror_to_session_id(
+                target["_webui_session_id"],
+                f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{webui_text}",
+                source_label="cron",
+                role="user",
+            )
+            if not ok:
+                webui_errors.append(
+                    f"WebUI session mirror failed for {target['_webui_session_id']}"
+                )
+            else:
+                logger.info(
+                    "Job '%s': delivered directly to WebUI session %s",
+                    job.get("id", "?"),
+                    target["_webui_session_id"],
+                )
+        targets = [target for target in targets if not target.get("_webui_session_id")]
+        if not targets:
+            return "; ".join(webui_errors) if webui_errors else None
+
     requested_media = [(str(p), v) for p, v in media_files]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Attachments the policy filter dropped will never be sent on ANY lane —
@@ -6440,11 +6490,12 @@ def run_job(
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # override via HERMES_CRON_TIMEOUT or the job's
+        # inactivity_timeout_seconds field.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _cron_timeout = _cron_inactivity_seconds()
+        _cron_timeout = _cron_inactivity_seconds(job)
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):

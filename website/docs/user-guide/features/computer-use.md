@@ -176,6 +176,53 @@ embedded service under the Hermes host identity.
 `smart` approval remains `standard`: an LLM classification cannot stand in for
 a reviewed manifest or a launch-time grant.
 
+## Cua Driver Computer History preview
+
+Recent Cua Driver nightlies include an opt-in, encrypted, metadata-only
+Computer History preview. Hermes integrates the preview through two
+discovery-gated read-only tools:
+
+- `history_status` — operational state only;
+- `history_query` — a bounded slice of typed action/session/lifecycle metadata.
+
+The preview never exposes screenshots, audio, URLs, paths, window titles,
+typed text, keystrokes, clipboard contents, raw tool arguments, raw tool
+results, encryption keys, or the encrypted files themselves. Hermes does not
+enable, pause, disable, delete, export, or change retention for the preview.
+
+When a user explicitly asks to continue, resume, pick up prior Cua work, or
+recall recent desktop activity, Hermes performs a deterministic preflight:
+`history_status` first, followed by at most one `history_query` with a limit of
+50. The result is treated as untrusted lead metadata, and current desktop
+state is still verified before acting. Unavailable, denied, empty, paused,
+dropped, or unhealthy history never blocks the primary task.
+
+### Install and admit the preview without enabling capture
+
+Computer History is currently shipped in the Cua nightly channel. The channel
+switch changes the local Cua binary, while `--experimental-history` only admits
+the preview in the daemon; capture remains off until the separate user opt-in:
+
+```bash
+cua-driver channel set nightly
+cua-driver update --apply
+open -n -g -a CuaDriver --args serve --experimental-history
+cua-driver history status --json
+```
+
+The expected safe baseline is `admitted: true`, `enabled: false`,
+`encrypted: true`, and `bytes_used: 0` on a fresh store. Do **not** run
+`cua-driver history enable` unless you explicitly want to opt into recording
+Cua-mediated action metadata locally.
+
+History reads are Cua private-observation (`R2`) operations. In standard mode,
+the Cua runtime requires a request-bound protected authorization host; Hermes'
+MCP subprocess path cannot invent that grant, so it fails closed with
+`history_authorization_required` and continues without history. A reviewed
+bounded capability manifest may authorize only `history_status` and
+`history_query` in a dedicated history lane, but that is a separate permission
+decision and must not be silently enabled by Hermes.
+
 <div class="alert alert--warning">
 
 YOLO/unrestricted mode does not protect against prompt injection or unintended

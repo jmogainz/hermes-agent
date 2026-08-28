@@ -672,6 +672,668 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     if cdp:
         env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
     return None
+def validate_native_target(target: dict[str, Any]) -> dict[str, Any]:
+    """Validate a browser-issued target before any secret is decrypted.
+
+    This is intentionally a small data validator.  The target must have been
+    minted by the browser auth-context runtime; this function only guarantees
+    that the descriptor is bounded and cannot become executable Python/JS.
+    """
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    if not isinstance(target, dict):
+        raise NativeAuthSecurityError("browser target is invalid")
+    allowed = {"strategy", "value", "frame_path", "target_id"}
+    if set(target) - allowed:
+        raise NativeAuthSecurityError("browser target contains unsupported metadata")
+    strategy = target.get("strategy")
+    value = target.get("value")
+    if strategy not in {"css", "xpath", "role", "label", "ref", "cdp"} or not isinstance(value, str):
+        raise NativeAuthSecurityError("browser target is invalid")
+    value = value.strip()
+    if not value or len(value) > 2048 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise NativeAuthSecurityError("browser target is invalid")
+    lowered = value.lower()
+    if "javascript:" in lowered or "<script" in lowered or "innerhtml" in lowered:
+        raise NativeAuthSecurityError("browser target contains executable content")
+    if strategy == "ref" and not re.fullmatch(r"@e[0-9]{1,8}", value):
+        raise NativeAuthSecurityError("browser ref target is invalid")
+    frame_path = target.get("frame_path")
+    if frame_path is not None:
+        if not isinstance(frame_path, list) or len(frame_path) > 8:
+            raise NativeAuthSecurityError("browser frame path is invalid")
+        if any(not isinstance(item, str) or not item or len(item) > 160 for item in frame_path):
+            raise NativeAuthSecurityError("browser frame path is invalid")
+    return dict(target, value=value)
+
+
+def _validate_expected_page_metadata(expected_origin: str, expected_path: str) -> tuple[str, str]:
+    from tools.native_auth_runtime import NativeAuthSecurityError
+    from urllib.parse import urlsplit
+
+    if not isinstance(expected_origin, str) or len(expected_origin) > 2048:
+        raise NativeAuthSecurityError("secure browser origin is invalid")
+    parsed = urlsplit(expected_origin)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise NativeAuthSecurityError("secure browser origin must be HTTPS")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise NativeAuthSecurityError("secure browser origin is invalid")
+    if not isinstance(expected_path, str) or len(expected_path) > 512:
+        raise NativeAuthSecurityError("secure browser path is invalid")
+    if not expected_path.startswith("/") or "?" in expected_path or "#" in expected_path or "\\" in expected_path:
+        raise NativeAuthSecurityError("secure browser path is invalid")
+    return expected_origin, expected_path
+
+
+def _secure_target_preflight_script(
+    target: dict[str, Any],
+    *,
+    expected_origin: str,
+    expected_path: str,
+    expected_tab_handle: str | None = None,
+    expected_frame_handle: str | None = None,
+    expected_document_generation: str | None = None,
+) -> str:
+    selector = target["value"]
+    selector_literal = json.dumps(selector, ensure_ascii=False)
+    if target["strategy"] == "css":
+        lookup = f"Array.from(document.querySelectorAll({selector_literal}))"
+    else:
+        lookup = (
+            "(() => { const result = []; const iterator = document.evaluate("
+            f"{selector_literal}, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null); "
+            "let node; while ((node = iterator.iterateNext())) result.push(node); return result; })()"
+        )
+    target_id = target.get("target_id")
+    target_check = ""
+    if target_id:
+        target_check = (
+            f"if ((window.__hermesNativeAuthTargetRefs || {{}})[{selector_literal}] !== "
+            f"{json.dumps(target_id, ensure_ascii=False)}) return false;"
+        )
+    identity_checks = ""
+    if expected_tab_handle:
+        identity_checks += (
+            f"if (window.__hermesNativeAuthTabHandle !== "
+            f"{json.dumps(expected_tab_handle, ensure_ascii=False)}) return false;"
+        )
+    if expected_frame_handle:
+        identity_checks += (
+            f"if (window.__hermesNativeAuthFrameHandle !== "
+            f"{json.dumps(expected_frame_handle, ensure_ascii=False)}) return false;"
+        )
+    generation_check = ""
+    if expected_document_generation:
+        generation_check = (
+            f"if (window.__hermesNativeAuthDocumentGeneration !== "
+            f"{json.dumps(expected_document_generation, ensure_ascii=False)}) return false;"
+        )
+    return (
+        "(() => {"
+        f"if (location.origin !== {json.dumps(expected_origin, ensure_ascii=False)} || "
+        f"location.pathname !== {json.dumps(expected_path, ensure_ascii=False)}) return false;"
+        f"{identity_checks}{generation_check}{target_check}"
+        f"const nodes = {lookup}; if (nodes.length !== 1) return false;"
+        "const element = nodes[0]; if (!(element instanceof Element)) return false;"
+        "const style = getComputedStyle(element); const rect = element.getBoundingClientRect();"
+        "if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;"
+        "if (element.disabled === true || element.readOnly === true || element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('inert')) return false;"
+        "return true;"
+        "})()"
+    )
+
+
+def secure_native_preflight(
+    *,
+    session: str,
+    target: dict[str, Any],
+    expected_origin: str,
+    expected_path: str,
+    expected_tab_handle: str | None = None,
+    expected_frame_handle: str | None = None,
+    expected_document_generation: str | None = None,
+) -> dict[str, Any]:
+    """Validate the live Browser Use page without receiving any secret."""
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    if not isinstance(session, str) or not _SESSION_RE.fullmatch(session):
+        raise NativeAuthSecurityError("secure browser session is invalid")
+    target = validate_native_target(target)
+    if target["strategy"] not in {"css", "xpath"} or target.get("frame_path"):
+        raise NativeAuthSecurityError("secure browser target strategy is unsupported by this adapter")
+    expected_origin, expected_path = _validate_expected_page_metadata(expected_origin, expected_path)
+    for name, value in (("tab", expected_tab_handle), ("frame", expected_frame_handle), ("document", expected_document_generation)):
+        if value is not None and (not isinstance(value, str) or not value or len(value) > 128 or any(ord(ch) < 0x20 for ch in value)):
+            raise NativeAuthSecurityError(f"secure browser {name} handle is invalid")
+
+    script = _secure_target_preflight_script(
+        target,
+        expected_origin=expected_origin,
+        expected_path=expected_path,
+        expected_tab_handle=expected_tab_handle,
+        expected_frame_handle=expected_frame_handle,
+        expected_document_generation=expected_document_generation,
+    )
+    code = (
+        "# Secure native auth target preflight\\n"
+        f"_hermes_preflight_ok = js({_json_string(script)})\\n"
+        "print('HERMES_NATIVE_AUTH_PREFLIGHT_OK' if _hermes_preflight_ok is True else 'HERMES_NATIVE_AUTH_PREFLIGHT_FAILED')\\n"
+    )
+    result = _decode_internal_browser_result(
+        browser_exec(
+            code=code,
+            session=session,
+            timeout_s=_DEFAULT_TIMEOUT_S,
+            _internal_native_auth=True,
+            _disable_native_auth_probe=True,
+        )
+    )
+    if "HERMES_NATIVE_AUTH_PREFLIGHT_OK" not in str(result.get("output") or ""):
+        raise NativeAuthSecurityError("secure browser target preflight failed")
+    return {"state": "validated"}
+def _decode_internal_browser_result(result: Any) -> dict[str, Any]:
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            raise NativeAuthSecurityError("secure browser operation returned invalid status") from None
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise NativeAuthSecurityError("secure browser operation failed")
+    return result
+
+
+def secure_native_fill(
+    *,
+    session: str,
+    target: dict[str, Any],
+    plaintext: str,
+    expected_origin: str | None = None,
+    expected_path: str | None = None,
+    expected_tab_handle: str | None = None,
+    expected_frame_handle: str | None = None,
+    expected_document_generation: str | None = None,
+) -> dict[str, Any]:
+    """Fill one browser-issued field through Browser Use stdin.
+
+    The generated program is delivered to the CLI through stdin (the same
+    channel as normal ``browser_exec`` code).  It is never put in argv.  The
+    helper prints only an opaque marker, and this function returns only an
+    opaque state to its caller.
+    """
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    if not isinstance(session, str) or not _SESSION_RE.fullmatch(session):
+        raise NativeAuthSecurityError("secure browser session is invalid")
+    target = validate_native_target(target)
+    if target["strategy"] not in {"css", "xpath"} or target.get("frame_path"):
+        raise NativeAuthSecurityError("secure browser target strategy is unsupported by this adapter")
+    if not isinstance(plaintext, str) or len(plaintext) > 4096 or "\x00" in plaintext:
+        raise NativeAuthSecurityError("secure browser field value is invalid")
+    if (expected_origin is None) != (expected_path is None):
+        raise NativeAuthSecurityError("secure browser page binding is incomplete")
+    if expected_origin is not None and expected_path is not None:
+        expected_origin, expected_path = _validate_expected_page_metadata(expected_origin, expected_path)
+    selector = target["value"] if target["strategy"] == "css" else "xpath=" + target["value"]
+    if expected_origin is not None and expected_path is not None:
+        live_script = _secure_target_preflight_script(
+            target,
+            expected_origin=expected_origin,
+            expected_path=expected_path,
+            expected_tab_handle=expected_tab_handle,
+            expected_frame_handle=expected_frame_handle,
+            expected_document_generation=expected_document_generation,
+        )
+        code = (
+            "# Secure native auth fill\n"
+            f"_hermes_native_auth_target_ok = js({_json_string(live_script)})\n"
+            "if _hermes_native_auth_target_ok is not True:\n"
+            "    print('HERMES_NATIVE_AUTH_FILL_FAILED')\n"
+            "else:\n"
+            f"    fill_input({json.dumps(selector, ensure_ascii=False)}, {json.dumps(plaintext, ensure_ascii=False)})\n"
+            "    print('HERMES_NATIVE_AUTH_FILLED')\n"
+        )
+    else:
+        code = (
+            "# Secure native auth fill\n"
+            f"fill_input({json.dumps(selector, ensure_ascii=False)}, {json.dumps(plaintext, ensure_ascii=False)})\n"
+            "print('HERMES_NATIVE_AUTH_FILLED')\n"
+        )
+    result = _decode_internal_browser_result(
+        browser_exec(
+            code=code,
+            session=session,
+            timeout_s=_DEFAULT_TIMEOUT_S,
+            _internal_native_auth=True,
+            _disable_native_auth_probe=True,
+        )
+    )
+    output = str(result.get("output") or "")
+    if "HERMES_NATIVE_AUTH_FILLED" not in output:
+        raise NativeAuthSecurityError("secure browser fill was not acknowledged")
+    return {"state": "filled"}
+
+
+def secure_native_action(
+    *,
+    session: str,
+    target: dict[str, Any] | None,
+    expected_origin: str | None = None,
+    expected_path: str | None = None,
+    expected_tab_handle: str | None = None,
+    expected_frame_handle: str | None = None,
+    expected_document_generation: str | None = None,
+) -> dict[str, Any]:
+    """Click a browser-issued action without exposing page state."""
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    if not isinstance(session, str) or not _SESSION_RE.fullmatch(session):
+        raise NativeAuthSecurityError("secure browser session is invalid")
+    target = validate_native_target(target or {})
+    if target["strategy"] not in {"css", "xpath"} or target.get("frame_path"):
+        raise NativeAuthSecurityError("secure browser action strategy is unsupported by this adapter")
+    if (expected_origin is None) != (expected_path is None):
+        raise NativeAuthSecurityError("secure browser page binding is incomplete")
+    if expected_origin is not None and expected_path is not None:
+        expected_origin, expected_path = _validate_expected_page_metadata(expected_origin, expected_path)
+    if expected_origin is not None and expected_path is not None:
+        script = _secure_target_preflight_script(
+            target,
+            expected_origin=expected_origin,
+            expected_path=expected_path,
+            expected_tab_handle=expected_tab_handle,
+            expected_frame_handle=expected_frame_handle,
+            expected_document_generation=expected_document_generation,
+        )
+        suffix = "return true;})()"
+        if not script.endswith(suffix):
+            raise NativeAuthSecurityError("secure browser action preflight is invalid")
+        script = script[:-len(suffix)] + "element.click(); return true;})()"
+    else:
+        selector = target["value"]
+        if target["strategy"] == "xpath":
+            script = (
+                "(() => { const e = document.evaluate(%s, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; "
+                "if (!e) return false; e.click(); return true; })()"
+            ) % json.dumps(selector, ensure_ascii=False)
+        else:
+            script = (
+                "(() => { const e = document.querySelector(%s); if (!e) return false; e.click(); return true; })()"
+            ) % json.dumps(selector, ensure_ascii=False)
+    code = (
+        "# Secure native auth action\n"
+        f"_ok = js({_json_string(script)})\n"
+        "print('HERMES_NATIVE_AUTH_SUBMITTED' if _ok is True else 'HERMES_NATIVE_AUTH_ACTION_MISSING')\n"
+    )
+    result = _decode_internal_browser_result(
+        browser_exec(
+            code=code,
+            session=session,
+            timeout_s=_DEFAULT_TIMEOUT_S,
+            _internal_native_auth=True,
+            _disable_native_auth_probe=True,
+        )
+    )
+    if "HERMES_NATIVE_AUTH_SUBMITTED" not in str(result.get("output") or ""):
+        raise NativeAuthSecurityError("secure browser action was not acknowledged")
+    return {"state": "submitted"}
+
+
+def _json_string(value: str) -> str:
+    """Return a Python string literal for internally generated browser code."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+_NATIVE_AUTH_CONTEXT_PREFIX = "HERMES_NATIVE_AUTH_CONTEXT:"
+
+# This helper runs inside the Browser Use/Playwright process. It deliberately
+# reads labels/roles/attributes only; it never reads input.value, innerText of
+# controls, cookies, storage, or page HTML. The generated CSS path is still
+# validated again by the parent secure-fill operation before decryption.
+_NATIVE_AUTH_PROBE_PREAMBLE = r'''
+def _hermes_native_auth_identity():
+    """Resolve the current Browser Use page to real CDP target/frame IDs."""
+    try:
+        from urllib.parse import urlsplit
+
+        current = js("location.origin + location.pathname")
+        if not isinstance(current, str) or not current.startswith("https://"):
+            return None
+        targets = cdp("Target.getTargets")
+        infos = targets.get("targetInfos", []) if isinstance(targets, dict) else []
+        matches = []
+        for info in infos:
+            if not isinstance(info, dict) or info.get("type") != "page":
+                continue
+            parsed = urlsplit(str(info.get("url") or ""))
+            candidate = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+            if candidate == current:
+                matches.append(info)
+        if len(matches) != 1:
+            return None
+        tree = cdp("Page.getFrameTree")
+        root = ((tree or {}).get("frameTree") or {}).get("frame") or {}
+        target_id = matches[0].get("targetId")
+        frame_id = root.get("id")
+        if not isinstance(target_id, str) or not isinstance(frame_id, str):
+            return None
+        return {
+            "tab_handle": target_id,
+            "frame_handle": frame_id,
+            "browser_context_id": str(matches[0].get("browserContextId") or ""),
+        }
+    except Exception:
+        return None
+
+
+def _hermes_native_auth_probe():
+    import json as _hermes_probe_json
+    identity = _hermes_native_auth_identity()
+    if not identity:
+        return None
+    _hermes_probe_script = r"""(() => {
+      const clean = (value, limit = 120) => String(value ?? "")
+        .replace(/[\\u0000-\\u001f\\u007f]/g, " ")
+        .replace(/\\s+/g, " ")
+        .trim()
+        .slice(0, limit);
+      const visible = (element) => {
+        if (!element || !(element instanceof Element)) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" &&
+          rect.width > 0 && rect.height > 0;
+      };
+      const escaped = (value) => {
+        if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
+        return String(value).replace(/[^A-Za-z0-9_-]/g, "\\\\$&");
+      };
+      const unique = (selector) => {
+        try { return document.querySelectorAll(selector).length === 1; }
+        catch (_) { return false; }
+      };
+      const randomHandle = (prefix) => {
+        try { return prefix + "_" + crypto.randomUUID().replace(/-/g, ""); }
+        catch (_) { return prefix + "_" + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+      };
+      const documentGeneration = window.__hermesNativeAuthDocumentGeneration || randomHandle("doc");
+      const tabHandle = window.__hermesNativeAuthTabHandle || randomHandle("tab");
+      const frameHandle = window.__hermesNativeAuthFrameHandle || randomHandle("frame");
+      window.__hermesNativeAuthDocumentGeneration = documentGeneration;
+      window.__hermesNativeAuthTabHandle = tabHandle;
+      window.__hermesNativeAuthFrameHandle = frameHandle;
+      const targetRefs = window.__hermesNativeAuthTargetRefs || {};
+      window.__hermesNativeAuthTargetRefs = targetRefs;
+      const targetFor = (element) => {
+        if (!element || !(element instanceof Element)) return null;
+        if (element.id) {
+          const selector = "#" + escaped(element.id);
+          if (unique(selector)) return selector;
+        }
+        const tag = element.tagName.toLowerCase();
+        for (const attribute of ["name", "autocomplete", "type", "aria-label"]) {
+          const raw = element.getAttribute(attribute);
+          if (!raw || raw.length > 100) continue;
+          const selector = tag + "[" + attribute + "=\\\"" + escaped(raw) + "\\\"]";
+          if (unique(selector)) return selector;
+        }
+        const parts = [];
+        let current = element;
+        for (let depth = 0; current && current.nodeType === 1 && depth < 8; depth += 1) {
+          const currentTag = current.tagName.toLowerCase();
+          let ordinal = 1;
+          for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+            if (sibling.tagName === current.tagName) ordinal += 1;
+          }
+          parts.unshift(currentTag + ":nth-of-type(" + ordinal + ")");
+          const candidate = parts.join(" > ");
+          if (unique(candidate)) return candidate;
+          current = current.parentElement;
+        }
+        return null;
+      };
+      const targetRefFor = (element) => {
+        const selector = targetFor(element);
+        if (!selector) return null;
+        if (!targetRefs[selector]) targetRefs[selector] = randomHandle("ref");
+        return {strategy: "css", value: selector, target_id: targetRefs[selector]};
+      };
+      const labelFor = (element) => {
+        const labelledBy = element.getAttribute("aria-labelledby");
+        if (labelledBy) {
+          const text = labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.textContent || "").join(" ");
+          if (clean(text)) return clean(text);
+        }
+        return clean(element.getAttribute("aria-label") || element.getAttribute("placeholder") || element.getAttribute("name") || "");
+      };
+      const kindFor = (element, label) => {
+        const text = (label + " " + (element.getAttribute("autocomplete") || "") + " " + (element.getAttribute("type") || "")).toLowerCase();
+        const type = (element.getAttribute("type") || "").toLowerCase();
+        if (type === "password" || text.includes("password")) return "password";
+        if (text.includes("passcode") || text.includes("pass code")) return "passcode";
+        if (text.includes("pin") && !text.includes("opinion")) return "pin";
+        if (text.includes("authenticator") || text.includes("totp")) return "totp_code";
+        if (text.includes("sms") || text.includes("text message")) return "sms_code";
+        if (text.includes("recovery")) return "recovery_code";
+        if (text.includes("backup") && text.includes("code")) return "backup_code";
+        if (text.includes("security question") || text.includes("security answer")) return "security_answer";
+        if (text.includes("date of birth") || text.includes("birth date")) return "date_of_birth";
+        if (text.includes("phone") || text.includes("mobile")) return "phone";
+        if (text.includes("organization") || text.includes("company")) return "organization";
+        if (text.includes("tenant") || text.includes("workspace")) return "tenant";
+        if (text.includes("invite") || text.includes("access code")) return "access_code";
+        if (text.includes("one-time") || text.includes("one time") || text.includes("otp")) return "one_time_code";
+        if (text.includes("verification") || text.includes("verify")) return "verification_code";
+        if (text.includes("username") || text.includes("user name")) return "username";
+        if (text.includes("email")) return "email";
+        if (type === "number") return "numeric";
+        return "identifier";
+      };
+      const fields = Array.from(document.querySelectorAll("input, textarea, select"))
+        .filter((element) => visible(element) && (element.getAttribute("type") || "text").toLowerCase() !== "hidden")
+        .map((element, index) => {
+          const target = targetRefFor(element);
+          if (!target) return null;
+          const label = labelFor(element);
+          return {
+            field_id: "field_" + (index + 1),
+            kind: kindFor(element, label),
+            label: label,
+            required: element.required || element.getAttribute("aria-required") === "true",
+            target: target
+          };
+        })
+        .filter(Boolean)
+        .slice(0, 32);
+      const actionElements = Array.from(document.querySelectorAll("button, input[type=submit], input[type=button], [role=button]"));
+      const actions = actionElements
+        .filter((element) => visible(element))
+        .map((element, index) => {
+          const target = targetRefFor(element);
+          if (!target) return null;
+          const label = clean(element.getAttribute("aria-label") || element.getAttribute("title") || element.textContent || element.getAttribute("name") || "");
+          const lower = label.toLowerCase();
+          let kind = null;
+          if (lower.includes("passkey")) kind = "passkey";
+          else if (lower.includes("security key") || lower.includes("hardware key")) kind = "security_key";
+          else if (lower.includes("captcha") || lower.includes("verification challenge")) kind = "captcha";
+          else if (lower.includes("push") && (lower.includes("approve") || lower.includes("approval"))) kind = "push_approval";
+          else if (lower.includes("device") && lower.includes("approv")) kind = "device_approval";
+          else if (lower.includes("continue with") || lower.includes("google") || lower.includes("microsoft") || lower.includes("okta") || lower.includes("sso")) kind = "sso_continue";
+          else if (lower.includes("magic link")) kind = "email_magic_link";
+          else if (lower.includes("phone verification")) kind = "phone_verification";
+          else if (lower === "cancel" || lower === "close") kind = "cancel";
+          else if (lower.includes("sign in") || lower.includes("signin") || lower.includes("log in") || lower.includes("login") || lower.includes("continue") || lower.includes("next") || lower.includes("verify") || lower.includes("submit") || lower.includes("authenticate")) kind = "submit";
+          if (!kind) return null;
+          return {action_id: "action_" + (index + 1), kind: kind, label: label, target: target};
+        })
+        .filter(Boolean)
+        .slice(0, 16);
+      const labels = fields.map((field) => field.label).concat(actions.map((action) => action.label));
+      return JSON.stringify({
+        origin: location.origin,
+        path: location.pathname,
+        title: clean(document.title, 160),
+        browser_session_id: clean(window.__hermesNativeAuthBrowserContextId || "", 128),
+        document_generation: documentGeneration,
+        tab_handle: tabHandle,
+        frame_handle: frameHandle,
+        fields: fields,
+        actions: actions,
+        signals: clean([document.title, location.pathname].concat(labels).join(" "), 512)
+      });
+    })()"""
+    try:
+        _identity_script = (
+            "(() => {"
+            f"window.__hermesNativeAuthTabHandle = {_hermes_probe_json.dumps(identity['tab_handle'])};"
+            f"window.__hermesNativeAuthFrameHandle = {_hermes_probe_json.dumps(identity['frame_handle'])};"
+            f"window.__hermesNativeAuthBrowserContextId = {_hermes_probe_json.dumps(identity.get('browser_context_id', ''))};"
+            f"return {_hermes_probe_script};"
+            "})()"
+        )
+        raw = js(_identity_script)
+        if isinstance(raw, str):
+            return _hermes_probe_json.loads(raw)
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+'''
+
+_NATIVE_AUTH_PROBE_CALL = r'''
+try:
+    _hermes_probe_identity = _hermes_native_auth_identity()
+    if _hermes_probe_identity:
+        print("HERMES_NATIVE_AUTH_PROBE_STATUS:ok")
+        _hermes_probe_payload = _hermes_native_auth_probe()
+        if _hermes_probe_payload:
+            print("HERMES_NATIVE_AUTH_CONTEXT:" + json.dumps(_hermes_probe_payload, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print("HERMES_NATIVE_AUTH_PROBE_STATUS:unavailable")
+except Exception:
+    print("HERMES_NATIVE_AUTH_PROBE_STATUS:unavailable")
+'''
+
+
+def _extract_native_auth_probe_output(output: str) -> tuple[str, dict[str, Any] | None]:
+    """Remove the private probe line from Browser Use stdout."""
+    if not isinstance(output, str):
+        return "", None
+    clean_lines: list[str] = []
+    extracted: dict[str, Any] | None = None
+    for line in output.splitlines():
+        if line.startswith(_NATIVE_AUTH_CONTEXT_PREFIX):
+            if extracted is not None:
+                return "", None
+            try:
+                payload = json.loads(line[len(_NATIVE_AUTH_CONTEXT_PREFIX):])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return "\n".join(clean_lines).strip(), None
+            if not isinstance(payload, dict):
+                return "\n".join(clean_lines).strip(), None
+            extracted = payload
+        else:
+            clean_lines.append(line)
+    return "\n".join(clean_lines).strip(), extracted
+
+
+def _native_auth_context_from_probe(payload: dict[str, Any], *, task_id: str | None, session: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or not task_id:
+        return None
+    from tools.browser_auth_context import detect_auth_context_from_descriptors
+    from tools.native_auth_runtime import native_auth_runtime
+    browser_session_id = payload.get("browser_session_id") or session or task_id
+    if not isinstance(browser_session_id, str) or not browser_session_id:
+        return None
+    internal = detect_auth_context_from_descriptors(
+        runtime=native_auth_runtime,
+        task_id=task_id,
+        browser_session_key=session or task_id,
+        browser_session_id=browser_session_id,
+        provider_origin=payload.get("origin", ""),
+        path=payload.get("path", "/"),
+        title=payload.get("title", ""),
+        fields=payload.get("fields") or [],
+        actions=payload.get("actions") or [],
+        signals=payload.get("signals", ""),
+        browser_backend="browser-use",
+        browser_session_name=session or "default",
+        document_generation=payload.get("document_generation"),
+        tab_handle=payload.get("tab_handle"),
+        frame_handle=payload.get("frame_handle"),
+    )
+    if internal is None:
+        return None
+    return native_auth_runtime.public_auth_context(internal["context_id"])
+
+
+def _decode_browser_exec_result(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+    return None
+
+
+def _browser_code_requires_interaction(code: str) -> bool:
+    """Return true for model code that can mutate/fill the browser page."""
+    if not isinstance(code, str):
+        return True
+    lowered = code.lower()
+    return any(
+        token in lowered
+        for token in (
+            "fill_input(",
+            "click_at_xy(",
+            "keyboard",
+            "press(",
+            ".click(",
+            "cdp(",
+            "js(",
+            "evaluate(",
+        )
+    )
+
+
+def _run_privileged_native_auth_probe(
+    *,
+    session: str,
+    task_id: str | None,
+    timeout_s: int,
+    local: bool,
+) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
+    """Run the fixed auth probe in a separate Browser Use invocation.
+
+    The model's browser Python is never included in this invocation, so stdout
+    cannot forge the probe marker or its browser-issued capabilities.
+    """
+    raw = browser_exec(
+        code=_NATIVE_AUTH_PROBE_PREAMBLE + "\n" + _NATIVE_AUTH_PROBE_CALL,
+        session=session,
+        task_id=task_id,
+        local=local,
+        timeout_s=min(int(timeout_s or _DEFAULT_TIMEOUT_S), _MAX_TIMEOUT_S),
+        _internal_native_auth=True,
+        _disable_native_auth_probe=True,
+        _privileged_native_auth_probe=True,
+    )
+    result = _decode_browser_exec_result(raw)
+    if result is None:
+        return False, None, None
+    output = str(result.get("output") or "")
+    status = None
+    for line in output.splitlines():
+        if line.startswith("HERMES_NATIVE_AUTH_PROBE_STATUS:"):
+            status = line.rsplit(":", 1)[-1].strip()
+            break
+    if result.get("success") is not True or status != "ok":
+        return False, None, result
+    return True, result.get("auth_context") if isinstance(result.get("auth_context"), dict) else None, result
 
 
 def browser_exec(
@@ -680,6 +1342,10 @@ def browser_exec(
     timeout_s: int = _DEFAULT_TIMEOUT_S,
     task_id: Optional[str] = None,
     local: bool = False,
+    *,
+    _internal_native_auth: bool = False,
+    _disable_native_auth_probe: bool = False,
+    _privileged_native_auth_probe: bool = False,
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
@@ -687,9 +1353,49 @@ def browser_exec(
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
+    if not _internal_native_auth:
+        try:
+            from tools.native_auth_runtime import native_auth_runtime
+
+            guard = native_auth_runtime.model_code_guard(
+                task_id or session or "default",
+                code,
+            )
+            if guard:
+                return tool_error(guard)
+        except Exception:
+            logger.debug("native auth model-code guard failed", exc_info=True)
+            return tool_error(
+                "Native auth browser guard is unavailable; refusing to execute "
+                "browser code until the auth boundary is healthy."
+            )
+
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
+    model_code = code
+
+    if task_id and not _internal_native_auth and not _disable_native_auth_probe:
+        probe_ok, auth_context, probe_result = _run_privileged_native_auth_probe(
+            session=session,
+            task_id=task_id,
+            timeout_s=timeout_s,
+            local=local,
+        )
+        if auth_context is not None:
+            return tool_result({
+                "success": True,
+                "exit_code": 0,
+                "output": "",
+                "auth_boundary_required": True,
+                "auth_context": auth_context,
+                "session": session,
+            })
+        if not probe_ok and _browser_code_requires_interaction(code):
+            return tool_error(
+                "Native auth browser probe is unavailable; refusing to execute "
+                "browser interaction code until the exact active page can be verified."
+            )
 
     cmd = _find_cli()
     if not cmd:
@@ -801,6 +1507,38 @@ def browser_exec(
         "exit_code": proc.returncode,
         "output": proc.stdout,
     }
+    if task_id or session:
+        clean_output, probe_payload = _extract_native_auth_probe_output(proc.stdout or "")
+        result["output"] = clean_output
+        if _privileged_native_auth_probe and probe_payload is not None:
+            auth_context = _native_auth_context_from_probe(
+                probe_payload,
+                task_id=task_id,
+                session=session or "default",
+            )
+            if auth_context is not None:
+                result["auth_context"] = auth_context
+        if task_id and not _internal_native_auth and not _disable_native_auth_probe:
+            post_probe_ok, post_auth_context, _post_probe_result = _run_privileged_native_auth_probe(
+                session=session,
+                task_id=task_id,
+                timeout_s=timeout_s,
+                local=local,
+            )
+            if post_auth_context is not None:
+                return tool_result({
+                    "success": True,
+                    "exit_code": 0,
+                    "output": "",
+                    "auth_boundary_required": True,
+                    "auth_context": post_auth_context,
+                    "session": session,
+                })
+            if not post_probe_ok and _browser_code_requires_interaction(model_code):
+                return tool_error(
+                    "Native auth browser post-probe is unavailable; withholding "
+                    "the browser interaction result until the active page can be verified."
+                )
     if workspace:
         result["workspace"] = workspace
     if session:
@@ -903,7 +1641,14 @@ _HELPERS_DIGEST = (
     "role/name/backendDOMNodeId (filter in Python before printing; it is "
     "thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) gives "
     "click coordinates. ensure_real_tab() recovers from a stale/internal "
-    "tab. Login walls: stop and ask the user; never guess credentials."
+    "tab. If an auth wall appears, stop using fill_input, js, or keyboard "
+    "actions for credentials. The browser result may include an `auth_context` "
+    "with opaque component IDs. Emit exactly one bounded "
+    "`<semreh.native-component>` metadata marker using the context ID "
+    "(presentation text only; do not invent selectors, URLs, HTML, JavaScript, "
+    "or values), then wait for the native component state before continuing. "
+    "Never guess, request, or transmit credentials, OTPs, cookies, tokens, or "
+    "form values."
 )
 
 

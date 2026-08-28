@@ -22,6 +22,9 @@ from tools.vision_tools import (
     _is_image_size_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
+    _detect_image_mime_type_from_bytes,
+    _is_heif_bytes,
+    transcode_heif_to_png,
     vision_analyze_tool,
     check_vision_requirements,
 )
@@ -1104,3 +1107,24 @@ class TestVisionCpuBurstCap:
             f"analyses were serialized to the cap (peak={calls_peak}); only the "
             "encode burst should be bounded, not the whole call"
         )
+
+
+class TestHeifMisnamedJpeg:
+    def test_heif_magic_is_image_not_unknown(self):
+        data = b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 32
+        assert _is_heif_bytes(data)
+        assert _detect_image_mime_type_from_bytes(data) == "image/heif"
+        assert transcode_heif_to_png(data) is None
+
+    @pytest.mark.asyncio
+    async def test_real_iphone_heif_named_jpg_resolves_to_png(self, tmp_path):
+        src = Path("/Users/jmogainz/.hermes/webui/attachments/996c9a9ec548/image_1787176676_E7EA.jpg")
+        if not src.is_file():
+            pytest.skip("live iPhone HEIF fixture not present")
+        dest = tmp_path / "shot.jpg"
+        dest.write_bytes(src.read_bytes())
+        from tools.image_source import resolve_image_source, ResolveContext
+
+        resolved = await resolve_image_source(str(dest), ResolveContext())
+        assert resolved.mime == "image/png"
+        assert resolved.data.startswith(b"\x89PNG\r\n\x1a\n")

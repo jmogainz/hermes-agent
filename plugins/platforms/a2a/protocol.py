@@ -23,13 +23,16 @@ from __future__ import annotations
 import json
 import copy
 import os
+import re
+import base64
+import mimetypes
 import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 PROTOCOL_VERSION = "1.0"
@@ -355,6 +358,94 @@ def extract_text(message_or_params: dict) -> str:
     return "\n".join(chunks).strip()
 
 
+_MEDIA_PATH_RE = re.compile(r"(?m)(?:^|\s)MEDIA:((?:/[^\s`]+|[A-Za-z]:\\[^\s`]+))")
+_MAX_A2A_FILE_BYTES = 32 * 1024 * 1024
+
+
+def inbox_dir() -> Path:
+    from hermes_constants import get_hermes_home
+    dest = get_hermes_home() / "a2a_inbox"
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _safe_filename(name: str, fallback: str = "attachment.bin") -> str:
+    base = os.path.basename((name or "").strip()) or fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or fallback
+    return cleaned[:180]
+
+
+def materialize_inbound_files(params: dict) -> list[str]:
+    """Save inbound A2A file parts to disk. Returns MEDIA: lines for the agent."""
+    msg = params.get("message", params)
+    parts = msg.get("parts", []) if isinstance(msg, dict) else []
+    notes: list[str] = []
+    dest = inbox_dir()
+    for idx, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        raw = part.get("raw") or part.get("bytes")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        fname = _safe_filename(str(part.get("filename") or part.get("name") or f"part-{idx}.bin"))
+        try:
+            data = base64.b64decode(raw, validate=False)
+        except Exception:
+            notes.append(f"[attachment decode failed: {fname}]")
+            continue
+        if len(data) > _MAX_A2A_FILE_BYTES:
+            notes.append(f"[attachment too large, skipped: {fname} ({len(data)} bytes)]")
+            continue
+        path = dest / fname
+        if path.exists():
+            stem, ext = os.path.splitext(fname)
+            path = dest / f"{stem}-{uuid.uuid4().hex[:8]}{ext}"
+        path.write_bytes(data)
+        mtype = part.get("mediaType") or part.get("mimeType") or ""
+        extra = f" ({mtype})" if mtype else ""
+        notes.append(f"[attachment saved] MEDIA:{path}{extra}")
+    return notes
+
+
+def extract_inbound_text(params: dict) -> str:
+    """Text plus materialized inbound file attachments."""
+    text = extract_text(params)
+    notes = materialize_inbound_files(params)
+    if not notes:
+        return text
+    extra = "\n".join(notes)
+    return f"{text}\n\n{extra}".strip() if text else extra
+
+
+def media_paths_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    seen: list[str] = []
+    for match in _MEDIA_PATH_RE.findall(text):
+        if match not in seen:
+            seen.append(match)
+    return seen
+
+
+def file_parts_from_text(text: str) -> list[dict]:
+    """Turn standalone MEDIA:/abs/path markers into A2A file parts."""
+    parts: list[dict] = []
+    for raw_path in media_paths_from_text(text):
+        path = Path(raw_path)
+        try:
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            if size <= 0 or size > _MAX_A2A_FILE_BYTES:
+                continue
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            continue
+        media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        parts.append(file_part(raw=encoded, filename=path.name, media_type=media_type))
+    return parts
+
+
 def extract_context_id(params: dict) -> str:
     """v1.0 puts contextId inside the Message; tolerate legacy top-level."""
     msg = params.get("message") or {}
@@ -387,11 +478,13 @@ def build_task(
         "status": {"state": state, "timestamp": now},
     }
     if agent_text:
-        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
+        parts = [text_part(agent_text)]
+        parts.extend(file_parts_from_text(agent_text))
+        task["status"]["message"] = message_with_parts(ROLE_AGENT, parts, context_id)
         if state == STATE_COMPLETED:
             task["artifacts"] = [{
                 "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(agent_text)],
+                "parts": parts,
             }]
     return task
 

@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 import gateway.mirror as mirror_mod
 from gateway.mirror import (
     mirror_to_session,
+    mirror_to_session_id,
     _find_session_id,
 )
 
@@ -116,6 +117,22 @@ class TestMirrorToSession:
             result = mirror_to_session("telegram", "99999", "Hello!")
 
         assert result is False
+
+
+    def test_direct_session_id_mirror(self):
+        with patch("gateway.mirror._append_to_sqlite", return_value=True) as mock_sqlite:
+            result = mirror_to_session_id(
+                "webui-session-123",
+                "[Cron delivery: test]\nhello",
+                source_label="cron",
+                role="user",
+            )
+
+        assert result is True
+        mock_sqlite.assert_called_once()
+        assert mock_sqlite.call_args.args[0] == "webui-session-123"
+        assert mock_sqlite.call_args.args[1]["role"] == "user"
+        assert "hello" in mock_sqlite.call_args.args[1]["content"]
 
 
 class TestAppendToSqlite:

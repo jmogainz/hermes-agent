@@ -703,7 +703,7 @@ class A2AAdapter(BasePlatformAdapter):
         the future the caller must wait on. Runs on an HTTP worker thread.
         """
         agent = agent or self._agents[""]
-        text = protocol.extract_text(params)
+        text = protocol.extract_inbound_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
 
