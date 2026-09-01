@@ -1,7 +1,7 @@
 ---
 name: google-workspace
 description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
-version: 1.1.0
+version: 1.2.0
 author: Nous Research
 license: MIT
 platforms: [linux, macos, windows]
@@ -19,11 +19,12 @@ metadata:
 
 # Google Workspace
 
-Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation.
+Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. Jacob's local default is read-only OAuth. Read email/calendar/docs/sheets by default; do not send email, modify Gmail, create/edit calendar events, or update Sheets unless Jacob explicitly asks to reauthorize broader write scopes.
 
 ## References
 
 - `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)
+- `references/daily-brief.md` — daily/morning brief procedure: schedule + conflicts + meeting prep + urgent mail from Gmail and Calendar. Load it when the user asks for a morning brief, meeting preparation, or "what's on my calendar and what email needs attention."
 
 ## Scripts
 
@@ -101,7 +102,7 @@ Tell the user:
 > 6. Download the JSON file and tell me the file path
 >
 > Important Hermes CLI note: if the file path starts with `/`, do NOT send only the bare path as its own message in the CLI, because it can be mistaken for a slash command. Send it in a sentence instead, like:
-> `The JSON file path is: /home/user/Downloads/client_secret_....json`
+> `The JSON file path is: ~/Downloads/client_secret_....json`
 
 Once they provide the path:
 
@@ -183,7 +184,8 @@ $GAPI gmail search "has:attachment filename:pdf newer_than:7d"
 # Read full message (returns JSON with body text)
 $GAPI gmail get MESSAGE_ID
 
-# Send
+# Write actions require explicit reauthorization beyond Jacob's default read-only token.
+# Do not run these unless Jacob asks to enable Google Workspace write access.
 $GAPI gmail send --to user@example.com --subject "Hello" --body "Message text"
 $GAPI gmail send --to user@example.com --subject "Report" --body "<h1>Q4</h1><p>Details...</p>" --html
 $GAPI gmail send --to user@example.com --subject "Hello" --from '"Research Agent" <user@example.com>' --body "Message text"
@@ -205,7 +207,7 @@ $GAPI gmail modify MESSAGE_ID --remove-labels UNREAD
 $GAPI calendar list
 $GAPI calendar list --start 2026-03-01T00:00:00Z --end 2026-03-07T23:59:59Z
 
-# Create event (ISO 8601 with timezone required)
+# Create event requires explicit writable Calendar reauthorization.
 $GAPI calendar create --summary "Team Standup" --start 2026-03-01T10:00:00-06:00 --end 2026-03-01T10:30:00-06:00
 $GAPI calendar create --summary "Lunch" --start 2026-03-01T12:00:00Z --end 2026-03-01T13:00:00Z --location "Cafe"
 $GAPI calendar create --summary "Review" --start 2026-03-01T14:00:00Z --end 2026-03-01T15:00:00Z --attendees "alice@co.com,bob@co.com"

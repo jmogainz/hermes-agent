@@ -1,14 +1,14 @@
 ---
-title: "Comfyui"
+title: "Comfyui — Generate images, video, and audio via diffusion workflows"
 sidebar_label: "Comfyui"
-description: "Generate images, video, and audio with ComfyUI — install, launch, manage nodes/models, run workflows with parameter injection"
+description: "Generate images, video, and audio via diffusion workflows"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Comfyui
 
-Generate images, video, and audio with ComfyUI — install, launch, manage nodes/models, run workflows with parameter injection. Uses the official comfy-cli for lifecycle and direct REST/WebSocket API for execution.
+Generate images, video, and audio via diffusion workflows.
 
 ## Skill metadata
 
@@ -16,12 +16,12 @@ Generate images, video, and audio with ComfyUI — install, launch, manage nodes
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/creative/comfyui` |
-| Version | `5.0.0` |
-| Author | ['kshitijk4poor', 'alt-glitch'] |
+| Version | `5.1.0` |
+| Author | ['kshitijk4poor', 'alt-glitch', 'purzbeats'] |
 | License | MIT |
 | Platforms | macos, linux, windows |
 | Tags | `comfyui`, `image-generation`, `stable-diffusion`, `flux`, `sd3`, `wan-video`, `hunyuan-video`, `creative`, `generative-ai`, `video-generation` |
-| Related skills | [`stable-diffusion-image-generation`](/docs/user-guide/skills/optional/mlops/mlops-stable-diffusion), `image_gen` |
+| Related skills | [`stable-diffusion`](/docs/user-guide/skills/optional/mlops/mlops-stable-diffusion) |
 
 ## Reference: full SKILL.md
 
@@ -42,6 +42,12 @@ for workflow execution.
 - `official-cli.md` — every `comfy ...` command, with flags
 - `rest-api.md` — REST + WebSocket endpoints (local + cloud), payload schemas
 - `workflow-format.md` — API-format JSON, common node types, param mapping
+- `template-integrity.md` — converting `comfyui-workflow-templates` from
+  editor format to API format: Reroute bypass, dotted dynamic-input keys
+  (`values.a`, `resize_type.width`), Cloud quirks (302 redirect, 1 concurrent
+  free-tier job, 1080p VRAM ceiling), Discord-compatible ffmpeg stitch.
+  Authored by [@purzbeats](https://github.com/purzbeats). Load this whenever
+  you're starting from an official template.
 
 **Scripts (`scripts/`):**
 
@@ -322,7 +328,7 @@ For users without a capable GPU or who want zero setup. Hosted on RTX 6000 Pro.
 2. Generate an API key at https://platform.comfy.org/login
 3. Set the key:
    ```bash
-   export COMFY_CLOUD_API_KEY="comfyui-xxxxxxxxxxxx"
+   export COMFY_CLOUD_API_KEY="your-comfyui-key"
    ```
 4. Run workflows:
    ```bash

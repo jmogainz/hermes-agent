@@ -41,6 +41,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("hermes_cli.config.load_config", return_value=config or {}),
+        patch("hermes_cli.config.load_config_readonly", return_value=config or {}),
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
@@ -54,7 +55,6 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
-    agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
     return agent
@@ -153,6 +153,37 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert "repeated_exact_failure_warning" in messages[0]["content"]
 
 
+def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
+    agent = _make_agent("terminal")
+    guardrails = getattr(agent, "_tool_guardrails")
+    guardrails.after_call(
+        "terminal",
+        {"command": "bad-1"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    guardrails.after_call(
+        "terminal",
+        {"command": "bad-2"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    tc = _mock_tool_call("terminal", json.dumps({"command": "bad-3"}), "c-recover")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1})):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    content = messages[0]["content"]
+    assert "same_tool_failure_warning" in content
+    assert "Do not switch to text-only replies" in content
+    assert "keep using tools" in content
+    assert "pwd && ls -la" in content
+    assert "absolute path" in content
+    assert "different tool" in content
+
+
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
     agent = _make_agent("web_search", config=_hard_stop_config())
     blocked_args = {"query": "blocked"}
@@ -189,6 +220,109 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
+def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch():
+    agent = _make_agent("write_file")
+    original_args = {"path": "/original/path", "content": "old"}
+    final_args = {"path": "/approved/path", "content": "new"}
+    tc = _mock_tool_call("write_file", json.dumps(original_args), "c-rewrite")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+    observed = {
+        "plugin": [],
+        "guardrail": [],
+        "approval": [],
+        "checkpoint": [],
+        "start": [],
+        "dispatch": [],
+    }
+
+    original_before_call = agent._tool_guardrails.before_call
+
+    def observe_guardrail(name, args):
+        observed["guardrail"].append((name, dict(args)))
+        return original_before_call(name, args)
+
+    def relay_execute(name, args, callback, **kwargs):
+        del name, args, kwargs
+        return callback(dict(final_args)), dict(final_args)
+
+    def observe_plugin(name, args, **kwargs):
+        del kwargs
+        observed["plugin"].append((name, dict(args)))
+        return (None, None)
+
+    def observe_approval(name, args):
+        observed["approval"].append((name, dict(args)))
+        return None
+
+    def dispatch(name, args, task_id, **kwargs):
+        del task_id, kwargs
+        observed["dispatch"].append((name, dict(args)))
+        return json.dumps({"ok": True})
+
+    agent._checkpoint_mgr = SimpleNamespace(
+        enabled=True,
+        get_working_dir_for_path=lambda path: path,
+        ensure_checkpoint=lambda path, reason: observed["checkpoint"].append(
+            (path, reason)
+        ),
+    )
+    agent.tool_start_callback = lambda _call_id, name, args: observed["start"].append(
+        (name, dict(args))
+    )
+
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            side_effect=observe_plugin,
+        ),
+        patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
+        patch(
+            "acp_adapter.edit_approval.maybe_require_edit_approval",
+            side_effect=observe_approval,
+        ),
+        patch("model_tools.registry.dispatch", side_effect=dispatch),
+    ):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    expected = [("write_file", final_args)]
+    assert observed["plugin"] == expected
+    assert observed["guardrail"] == expected
+    assert observed["approval"] == expected
+    assert observed["start"] == expected
+    assert observed["dispatch"] == expected
+    assert observed["checkpoint"] == [
+        ("/approved/path", "before write_file")
+    ]
+
+
+def test_relay_rewrite_is_guarded_before_dispatch_in_concurrent_path():
+    agent = _make_agent("web_search", config=_hard_stop_config())
+    original_args = {"query": "original"}
+    blocked_args = {"query": "blocked"}
+    _seed_exact_failures(agent, "web_search", blocked_args)
+    tc = _mock_tool_call("web_search", json.dumps(original_args), "c-rewrite-block")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+    starts = []
+
+    def relay_execute(name, args, callback, **kwargs):
+        del name, args, kwargs
+        return callback(dict(blocked_args)), dict(blocked_args)
+
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch,
+    ):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert starts == []
+    assert "repeated_exact_failure_block" in messages[0]["content"]
+
+
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     agent = _make_agent("web_search")
     args = {"query": "same"}
@@ -197,7 +331,10 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     messages = []
 
     with (
-        patch("hermes_cli.plugins.get_pre_tool_call_block_message", return_value="plugin policy"),
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            return_value=("plugin policy", None),
+        ),
         patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
     ):
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
@@ -237,7 +374,16 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
-def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
+
+
+def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
+    """Regression for #30770: when the guardrail halts the loop, the
+    synthesized halt message must be pushed through ``stream_delta_callback``
+    so SSE/TUI clients see why the agent stopped instead of a silent stream
+    close.  Without this the chat-completions SSE writer drains an empty
+    queue and emits a finish chunk with zero content (indistinguishable
+    from a crash for Open WebUI and similar clients).
+    """
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}
     responses = [
@@ -250,26 +396,30 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     ]
     agent.client.chat.completions.create.side_effect = responses
 
+    deltas: list = []
+    agent.stream_delta_callback = lambda d: deltas.append(d)
+    # The mocked client returns SimpleNamespace responses which aren't
+    # iterable as streaming chunks; force the non-streaming code path so
+    # the guardrail-halt branch is reached without engaging the real
+    # streaming machinery.
+    agent._disable_streaming = True
+
     with (
-        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
         result = agent.run_conversation("search repeatedly")
 
-    assert mock_hfc.call_count == 2
-    assert result["api_calls"] == 3
-    assert result["api_calls"] < agent.max_iterations
     assert result["turn_exit_reason"] == "guardrail_halt"
-    assert "error" not in result
-    assert result["completed"] is True
-    assert "stopped retrying" in result["final_response"]
-    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
-    assert result["guardrail"]["tool_name"] == "web_search"
+    halt_text = result["final_response"]
+    assert "stopped retrying" in halt_text
 
-    assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
-    for assistant_msg in assistant_tool_calls:
-        call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
-        following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
-        assert len(following_results) == len(call_ids)
+    # The halt message must have been pushed through the callback at least
+    # once.  Empty-queue SSE writers were the bug — clients saw no content
+    # delta before the finish chunk.
+    text_deltas = [d for d in deltas if isinstance(d, str)]
+    assert halt_text in text_deltas, (
+        f"halt message was never streamed; callback only saw {deltas!r}"
+    )

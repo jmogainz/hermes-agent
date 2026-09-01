@@ -9,7 +9,7 @@ description: "How to build a model provider (inference backend) plugin for Herme
 Model provider plugins declare an inference backend — an OpenAI-compatible endpoint, an Anthropic Messages server, a Codex-style Responses API, or a Bedrock-native surface — that Hermes can route `AIAgent` calls through. Every built-in provider (OpenRouter, Anthropic, GMI, DeepSeek, Nvidia, …) ships as one of these plugins. Third parties can add their own by dropping a directory under `$HERMES_HOME/plugins/model-providers/` with zero changes to the repo.
 
 :::tip
-Model provider plugins are the third kind of **provider plugin**. The others are [Memory Provider Plugins](/docs/developer-guide/memory-provider-plugin) (cross-session knowledge) and [Context Engine Plugins](/docs/developer-guide/context-engine-plugin) (context compression strategies). All three follow the same "drop a directory, declare a profile, no repo edits" pattern.
+Model provider plugins are the third kind of **provider plugin**. The others are [Memory Provider Plugins](/developer-guide/memory-provider-plugin) (cross-session knowledge) and [Context Engine Plugins](/developer-guide/context-engine-plugin) (context compression strategies). All three follow the same "drop a directory, declare a profile, no repo edits" pattern.
 :::
 
 ## How discovery works
@@ -89,7 +89,7 @@ Full definition in `providers/base.py`. The most useful ones:
 
 | Field | Type | Purpose |
 |---|---|---|
-| `name` | str | Canonical id — matches `--provider` choices and `HERMES_INFERENCE_PROVIDER` |
+| `name` | str | Canonical id — matches `model.provider` in `config.yaml` and the `--provider` flag |
 | `aliases` | `tuple[str, ...]` | Alternative names resolved by `get_provider_profile()` (e.g. `grok` → `xai`) |
 | `api_mode` | str | `chat_completions` \| `codex_responses` \| `anthropic_messages` \| `bedrock_converse` |
 | `display_name` | str | Human label shown in `hermes model` picker |
@@ -131,15 +131,16 @@ class AcmeProfile(ProviderProfile):
 
     def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
         """Returns (extra_body_additions, top_level_kwargs). Needed when some
-        fields go top-level (Kimi's reasoning_effort) and some go in extra_body
-        (OpenRouter's reasoning dict). Default: ({}, {})."""
+        fields go top-level (Kimi's reasoning_effort, OpenRouter's verbosity for
+        adaptive Anthropic models) and some go in extra_body (OpenRouter's
+        reasoning dict). Default: ({}, {})."""
         return {}, {}
 
-    def fetch_models(self, *, api_key=None, timeout=8.0) -> list[str] | None:
+    def fetch_models(self, *, api_key=None, base_url=None, timeout=8.0) -> list[str] | None:
         """Live catalog fetch. Default hits {models_url or base_url}/models with
         Bearer auth. Override for: custom auth (Anthropic), no REST endpoint
         (Bedrock → None), or public/unauthenticated catalogs (OpenRouter)."""
-        return super().fetch_models(api_key=api_key, timeout=timeout)
+        return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
 ```
 
 ## Hook reference examples
@@ -194,7 +195,7 @@ Set `profile.api_mode` to match the default your provider ships — it acts as a
 |---|---|---|
 | `api_key` | Single env var carries a static API key | Most providers |
 | `oauth_device_code` | Device-code OAuth flow | — |
-| `oauth_external` | User signs in elsewhere, tokens land in `auth.json` | Anthropic OAuth, MiniMax OAuth, Gemini Cloud Code, Qwen Portal, Nous Portal |
+| `oauth_external` | User signs in elsewhere, tokens land in `auth.json` | Anthropic OAuth, MiniMax OAuth, Qwen Portal, Nous Portal |
 | `copilot` | GitHub Copilot token refresh cycle | `copilot` plugin only |
 | `aws_sdk` | AWS SDK credential chain (IAM role, profile, env) | `bedrock` plugin only |
 | `external_process` | Auth handled by a subprocess the agent spawns | `copilot-acp` plugin only |
@@ -247,21 +248,56 @@ The general `PluginManager` (the thing `hermes plugins` operates on) **sees** mo
 
 ## Distribute via pip
 
-Like any Hermes plugin, model providers can ship as a pip package. Add an entry point to your `pyproject.toml`:
+Model providers can ship as a pip package. Expose an entry point in the
+`hermes_agent.plugins` group in your `pyproject.toml`:
 
 ```toml
-[project.entry-points."hermes.plugins"]
+[project.entry-points."hermes_agent.plugins"]
 acme-inference = "acme_hermes_plugin:register"
 ```
 
-…where `acme_hermes_plugin:register` is a function that calls `register_provider(profile)`. The general PluginManager picks up entry-point plugins during `discover_and_load()`. For `kind: model-provider` pip plugins, you still need to declare the kind in your manifest (or rely on the source-text heuristic).
+The target may be either:
 
-See [Building a Hermes Plugin](/docs/guides/build-a-hermes-plugin#distribute-via-pip) for the full entry-points setup.
+- a **callable** (`module:func`) — invoked with no arguments; it should call
+  `register_provider(profile)`, or
+- a **bare module** (`module`) — imported for its module-level
+  `register_provider(...)` side effect, mirroring the directory-plugin
+  `__init__.py` contract.
+
+`providers/__init__.py` discovers these entry points itself — the general
+`PluginManager` never invokes provider registration for pip packages (its
+entry-point path targets `register(ctx)`-style general plugins, gated by
+`plugins.enabled`), so the provider registry does its own scan. Two rules
+apply:
+
+- **Opt-in required.** The same `plugins.enabled` allow-list (and
+  `plugins.disabled` deny-list) from `config.yaml` governs this scan. A pip
+  package is never imported just because it is installed — users must add the
+  entry-point name to `plugins.enabled`:
+
+  ```yaml
+  plugins:
+    enabled:
+      - acme-inference
+  ```
+
+- **Lowest precedence.** Entry-point plugins are discovered **before**
+  filesystem plugins: because `register_provider()` is last-writer-wins, a
+  bundled or `$HERMES_HOME` profile of the same name always overrides a
+  pip-installed one. A pip package can add a genuinely new provider, but
+  cannot silently hijack a first-party provider name.
+
+Targets that require arguments (a general plugin's `register(ctx)`) are
+skipped by the provider scan — they belong to the `PluginManager`. A broken
+entry point is isolated — it is logged at warning level and skipped, and never
+blocks discovery of the other providers.
+
+See [Building a Hermes Plugin](/developer-guide/plugins#distribute-via-pip) for the full entry-points setup.
 
 ## Related pages
 
-- [Provider Runtime](/docs/developer-guide/provider-runtime) — resolution precedence + where each layer reads the profile
-- [Adding Providers](/docs/developer-guide/adding-providers) — end-to-end checklist for new inference backends (covers both the fast plugin path and the full CLI/auth integration)
-- [Memory Provider Plugins](/docs/developer-guide/memory-provider-plugin)
-- [Context Engine Plugins](/docs/developer-guide/context-engine-plugin)
-- [Building a Hermes Plugin](/docs/guides/build-a-hermes-plugin) — general plugin authoring
+- [Provider Runtime](/developer-guide/provider-runtime) — resolution precedence + where each layer reads the profile
+- [Adding Providers](/developer-guide/adding-providers) — end-to-end checklist for new inference backends (covers both the fast plugin path and the full CLI/auth integration)
+- [Memory Provider Plugins](/developer-guide/memory-provider-plugin)
+- [Context Engine Plugins](/developer-guide/context-engine-plugin)
+- [Building a Hermes Plugin](/developer-guide/plugins) — general plugin authoring

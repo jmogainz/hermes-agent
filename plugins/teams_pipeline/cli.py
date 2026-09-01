@@ -24,7 +24,6 @@ from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipel
 from plugins.teams_pipeline.subscriptions import (
     build_graph_client,
     maintain_graph_subscriptions,
-    sync_graph_subscription_record,
 )
 from tools.microsoft_graph_auth import MicrosoftGraphConfigError, MicrosoftGraphTokenProvider
 
@@ -48,6 +47,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     fetch_p = subs.add_parser("fetch", aliases=["test"], help="Dry-run meeting artifact resolution")
     fetch_p.add_argument("--meeting-id", default="")
     fetch_p.add_argument("--join-web-url", default="")
+    fetch_p.add_argument(
+        "--organizer-user-id",
+        default="",
+        help="Microsoft Entra user ID for organizer-scoped online meeting lookup",
+    )
     fetch_p.add_argument("--tenant-id", default="")
     fetch_p.add_argument("--call-record-id", default="")
 
@@ -99,15 +103,15 @@ def teams_pipeline_command(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        if action in ("list", "ls"):
+        if action in {"list", "ls"}:
             _cmd_list(args)
         elif action == "show":
             _cmd_show(args)
-        elif action in ("run", "replay"):
+        elif action in {"run", "replay"}:
             _cmd_run(args)
-        elif action in ("fetch", "test"):
+        elif action in {"fetch", "test"}:
             _cmd_fetch(args)
-        elif action in ("subscriptions", "subs"):
+        elif action in {"subscriptions", "subs"}:
             _cmd_subscriptions(args)
         elif action == "subscribe":
             _cmd_subscribe(args)
@@ -117,7 +121,7 @@ def teams_pipeline_command(args: argparse.Namespace) -> int:
             _cmd_delete_subscription(args)
         elif action == "maintain-subscriptions":
             _cmd_maintain_subscriptions(args)
-        elif action in ("token-health", "token"):
+        elif action in {"token-health", "token"}:
             _cmd_token_health(args)
         elif action == "validate":
             _cmd_validate(args)
@@ -307,6 +311,7 @@ def _cmd_run(args) -> None:
 def _cmd_fetch(args) -> None:
     meeting_id = str(getattr(args, "meeting_id", "") or "").strip() or None
     join_web_url = str(getattr(args, "join_web_url", "") or "").strip() or None
+    organizer_user_id = str(getattr(args, "organizer_user_id", "") or "").strip() or None
     tenant_id = str(getattr(args, "tenant_id", "") or "").strip() or None
     call_record_id = str(getattr(args, "call_record_id", "") or "").strip() or None
     if not meeting_id and not join_web_url:
@@ -320,6 +325,7 @@ def _cmd_fetch(args) -> None:
             meeting_id=meeting_id,
             join_web_url=join_web_url,
             tenant_id=tenant_id,
+            organizer_user_id=organizer_user_id,
         )
     )
     transcript_artifact, transcript_text = _run_async(fetch_preferred_transcript_text(client, meeting_ref))

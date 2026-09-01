@@ -1,20 +1,49 @@
 import {
-  HISTORY_RENDER_MAX_CHARS,
-  HISTORY_RENDER_MAX_LINES,
   LIVE_RENDER_MAX_CHARS,
   LIVE_RENDER_MAX_LINES,
-  THINKING_COT_MAX
+  THINKING_COT_MAX,
+  VERBOSE_TRAIL_MAX_CHARS,
+  VERBOSE_TRAIL_MAX_LINES
 } from '../config/limits.js'
 import { VERBS } from '../content/verbs.js'
 import type { ThinkingMode } from '../types.js'
 
 const ESC = String.fromCharCode(27)
-const ANSI_RE = new RegExp(`${ESC}\\[[0-9;]*m`, 'g')
+const BEL = String.fromCharCode(7)
+const ANSI_CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
+const ANSI_CSI_WITH_CMD_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*([@-~])`, 'g')
+const ANSI_INCOMPLETE_CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*(?=${ESC}|\\n|$)`, 'g')
+const ANSI_OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
+const ANSI_STRING_RE = new RegExp(`${ESC}[PX^_][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
+const ANSI_NON_CSI_ESC_SEQ_RE = new RegExp(`${ESC}(?!\\[|\\]|P|X|\\^|_)[ -/]*[0-~]`, 'g')
+const ANSI_STRAY_ESC_RE = new RegExp(`${ESC}(?!\\[)[\\s\\S]?`, 'g')
+// eslint-disable-next-line no-control-regex -- intentionally strips C0/C1 control chars
+const CONTROL_RE = /[\x00-\x08\x0B\x0C\x0D\x0E-\x1A\x1C-\x1F\x7F]/g
 const WS_RE = /\s+/g
 
-export const stripAnsi = (s: string) => s.replace(ANSI_RE, '')
+export const stripAnsi = (s: string) =>
+  s
+    .replace(ANSI_OSC_RE, '')
+    .replace(ANSI_STRING_RE, '')
+    .replace(ANSI_INCOMPLETE_CSI_RE, '')
+    .replace(ANSI_CSI_RE, '')
+    .replace(ANSI_INCOMPLETE_CSI_RE, '')
+    .replace(ANSI_NON_CSI_ESC_SEQ_RE, '')
+    .replace(ANSI_STRAY_ESC_RE, '')
+    .replace(CONTROL_RE, '')
 
-export const hasAnsi = (s: string) => s.includes(`${ESC}[`) || s.includes(`${ESC}]`)
+export const sanitizeAnsiForRender = (s: string) =>
+  s
+    .replace(ANSI_OSC_RE, '')
+    .replace(ANSI_STRING_RE, '')
+    .replace(ANSI_INCOMPLETE_CSI_RE, '')
+    .replace(ANSI_CSI_WITH_CMD_RE, (seq, cmd: string) => (cmd === 'm' ? seq : ''))
+    .replace(ANSI_INCOMPLETE_CSI_RE, '')
+    .replace(ANSI_NON_CSI_ESC_SEQ_RE, '')
+    .replace(ANSI_STRAY_ESC_RE, '')
+    .replace(CONTROL_RE, '')
+
+export const hasAnsi = (s: string) => s.includes(ESC)
 
 const renderEstimateLine = (line: string) => {
   const trimmed = line.trim()
@@ -90,8 +119,17 @@ export const cleanThinkingText = (reasoning: string) =>
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 
+// cleanThinkingText runs several full-string regex passes (split/map/filter/join/replace).
+// reasoning grows on every streamed token, so without a pre-bound this re-cleans the whole
+// accumulated string on every chunk — O(n) work per token, O(n^2) over a stream. Only the
+// tail is ever displayed (boundedLiveRenderText caps it further downstream), so bound the
+// input here first. Headroom over LIVE_RENDER_MAX_CHARS keeps line-boundary trimming inside
+// cleanThinkingText accurate even after slicing mid-line.
+const THINKING_CLEAN_TAIL_BOUND = LIVE_RENDER_MAX_CHARS * 1.5
+
 export const thinkingPreview = (reasoning: string, mode: ThinkingMode, max: number = THINKING_COT_MAX) => {
-  const raw = cleanThinkingText(reasoning)
+  const bounded = reasoning.length > THINKING_CLEAN_TAIL_BOUND ? reasoning.slice(-THINKING_CLEAN_TAIL_BOUND) : reasoning
+  const raw = cleanThinkingText(bounded)
 
   return !raw || mode === 'collapsed' ? '' : mode === 'full' ? raw : compactPreview(raw.replace(WS_RE, ' '), max)
 }
@@ -100,11 +138,6 @@ export const boundedLiveRenderText = (
   text: string,
   { maxChars = LIVE_RENDER_MAX_CHARS, maxLines = LIVE_RENDER_MAX_LINES } = {}
 ) => boundedRenderText(text, 'showing live tail', { maxChars, maxLines })
-
-export const boundedHistoryRenderText = (
-  text: string,
-  { maxChars = HISTORY_RENDER_MAX_CHARS, maxLines = HISTORY_RENDER_MAX_LINES } = {}
-) => boundedRenderText(text, 'showing tail', { maxChars, maxLines })
 
 const boundedRenderText = (
   text: string,
@@ -191,6 +224,38 @@ export const buildToolTrailLine = (
   return `${formatToolCall(name, context)}${took}${detail ? ` :: ${detail}` : ''} ${error ? '✗' : '✓'}`
 }
 
+const verboseToolBlock = (label: string, text?: string) => {
+  const body = (text ?? '').trim()
+
+  // Persisted trail blocks are kept all session and rendered expanded by
+  // default — cap to a small readable preview (NOT the 16KB live-render
+  // budget) so a large tool output can't balloon the Ink render tree and
+  // silently OOM-kill the TUI. See VERBOSE_TRAIL_MAX_CHARS (#34095).
+  return body
+    ? `${label}:\n${boundedLiveRenderText(body, {
+        maxChars: VERBOSE_TRAIL_MAX_CHARS,
+        maxLines: VERBOSE_TRAIL_MAX_LINES
+      })}`
+    : ''
+}
+
+export const buildVerboseToolTrailLine = (
+  name: string,
+  context: string,
+  error?: boolean,
+  duration?: number,
+  argsText?: string,
+  resultText?: string
+) => {
+  const detail = [verboseToolBlock('Args', argsText), verboseToolBlock(error ? 'Error' : 'Result', resultText)]
+    .filter(Boolean)
+    .join('\n')
+
+  const took = duration !== undefined ? ` (${duration.toFixed(1)}s)` : ''
+
+  return `${formatToolCall(name, context)}${took}${detail ? ` :: ${detail}` : ''} ${error ? '✗' : '✓'}`
+}
+
 export const isToolTrailResultLine = (line: string) => line.endsWith(' ✓') || line.endsWith(' ✗')
 
 export const parseToolTrailResultLine = (line: string) => {
@@ -200,10 +265,10 @@ export const parseToolTrailResultLine = (line: string) => {
 
   const mark = line.endsWith(' ✗') ? '✗' : '✓'
   const body = line.slice(0, -2)
-  const [call, detail] = body.split(' :: ', 2)
+  const sep = body.indexOf(' :: ')
 
-  if (detail != null) {
-    return { call, detail, mark }
+  if (sep >= 0) {
+    return { call: body.slice(0, sep), detail: body.slice(sep + 4), mark }
   }
 
   const legacy = body.indexOf(': ')
@@ -282,6 +347,65 @@ export const estimateRows = (text: string, w: number, compact = false) => {
   }
 
   return Math.max(1, rows)
+}
+
+/**
+ * Render an unanswered clarify prompt (timed out, or cancelled with Esc/Ctrl+C)
+ * as a persistent transcript block.  The live `ClarifyPrompt` overlay is torn
+ * down the moment the turn settles, so without this the question + options
+ * vanish from the screen while the agent's follow-up still refers to "the
+ * options above".  Mirrors the option formatting in ClarifyPrompt (the same
+ * 1-based numbered list) so the persisted record reads identically to what was
+ * on screen.  `reason` states why the prompt ended ("timed out", "cancelled").
+ */
+export const formatAbandonedClarify = (question: string, choices: string[] | null, reason: string) => {
+  const head = `ask ${question.trim()}`
+  const opts = (choices ?? []).map((c, i) => `  ${i + 1}. ${c}`)
+
+  return [head, ...opts, `  (${reason} — no selection)`].join('\n')
+}
+
+/**
+ * Batch counterpart of `formatAbandonedClarify`: every question on its own
+ * line, answered ones keeping their locked answer (partials survive a
+ * timeout server-side, so the record must show what was actually sent).
+ */
+export const formatAbandonedClarifyBatch = (
+  questions: { qid: string; question: string }[],
+  answers: Record<string, string>,
+  reason: string
+) => {
+  const lines = questions.map(q => {
+    const answer = answers[q.qid]
+
+    return answer ? `  ✓ ${q.question} → ${answer}` : `  · ${q.question} (no answer)`
+  })
+
+  return [`ask (${questions.length} questions)`, ...lines, `  (${reason})`].join('\n')
+}
+
+/**
+ * Cursor/draft restore for re-visiting an answered batch clarify question
+ * (Tab/Shift-Tab): a choice answer puts the cursor back on its row; an
+ * answer that matches no choice was typed via Other, so the cursor lands on
+ * the Other row (index = choices.length) with the text staged for editing.
+ * Unanswered questions restore to a clean cursor.
+ */
+export const clarifyBatchRevisitState = (
+  choices: readonly string[],
+  answer: string | undefined
+): { custom: string; sel: number } => {
+  if (answer === undefined || answer === '') {
+    return { custom: '', sel: 0 }
+  }
+
+  const choiceIndex = choices.indexOf(answer)
+
+  if (choiceIndex >= 0) {
+    return { custom: '', sel: choiceIndex }
+  }
+
+  return { custom: answer, sel: choices.length > 0 ? choices.length : 0 }
 }
 
 export const flat = (r: Record<string, string[]>) => Object.values(r).flat()

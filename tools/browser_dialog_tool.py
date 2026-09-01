@@ -6,7 +6,7 @@ accept or dismiss.
 
 Gated on the same ``_browser_cdp_check`` as ``browser_cdp`` so it only
 appears when a CDP endpoint is reachable (Browserbase with a
-``connectUrl``, local Chrome via ``/browser connect``, or
+``connectUrl``, local Chromium-family browser via ``/browser connect``, or
 ``browser.cdp_url`` set in config).
 
 See ``website/docs/developer-guide/browser-supervisor.md`` for the full
@@ -40,7 +40,7 @@ BROWSER_DIALOG_SCHEMA: Dict[str, Any] = {
         "happens when a second dialog fires while the first is still open), "
         "pass ``dialog_id`` from the snapshot to disambiguate.\n\n"
         "**Availability:** only present when a CDP-capable backend is "
-        "attached — Browserbase sessions, local Chrome via "
+        "attached — Browserbase sessions, local Chromium-family browser via "
         "``/browser connect``, or ``browser.cdp_url`` in config.yaml. "
         "Not available on Camofox (REST-only) or the default Playwright "
         "local browser (CDP port is hidden)."
@@ -87,6 +87,26 @@ def browser_dialog(
 ) -> str:
     """Respond to a pending dialog on the active task's CDP supervisor."""
     effective_task_id = task_id or "default"
+    try:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        native_blocked = native_auth_runtime.model_browser_mutation_guard(
+            effective_task_id,
+            action="dialog response",
+        )
+    except Exception:
+        logger.exception("native auth dialog guard unavailable")
+        native_blocked = "auth_boundary_required: native authentication guard unavailable"
+    if native_blocked:
+        return json.dumps(
+            {
+                "success": False,
+                "error": native_blocked,
+                "auth_boundary_required": True,
+            },
+            ensure_ascii=False,
+        )
+
     supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
     if supervisor is None:
         return json.dumps(

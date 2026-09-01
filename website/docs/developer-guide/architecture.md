@@ -40,7 +40,7 @@ This page is the top-level map of Hermes Agent internals. Use it to orient yours
            ▼                                    ▼
 ┌───────────────────┐              ┌──────────────────────┐
 │ Session Storage   │              │ Tool Backends         │
-│ (SQLite + FTS5)   │              │ Terminal (7 backends) │
+│ (SQLite + FTS5)   │              │ Terminal (6 backends) │
 │ hermes_state.py   │              │ Browser (5 backends)  │
 │ gateway/session.py│              │ Web (4 backends)      │
 └───────────────────┘              │ MCP (dynamic)         │
@@ -117,21 +117,22 @@ hermes-agent/
 │   ├── mirror.py             # Cross-session message mirroring
 │   ├── status.py             # Token locks, profile-scoped process tracking
 │   ├── builtin_hooks/        # Extension point for always-registered hooks (none shipped)
-│   └── platforms/            # 20 adapters: telegram, discord, slack, whatsapp,
-│                             #   signal, matrix, mattermost, email, sms,
-│                             #   dingtalk, feishu, wecom, wecom_callback, weixin,
-│                             #   bluebubbles, qqbot, homeassistant, webhook, api_server,
-│                             #   yuanbao
+│   └── platforms/            # Built-in adapters: signal, weixin, bluebubbles,
+│                             #   qqbot, whatsapp_cloud, yuanbao, webhook, api_server
+│
+├── plugins/platforms/        # Bundled platform plugins: telegram, discord, slack,
+│                             #   whatsapp, matrix, mattermost, email, sms, dingtalk,
+│                             #   feishu, wecom, homeassistant, irc, line, teams,
+│                             #   google_chat, buzz, ntfy, photon, raft, simplex
 │
 ├── acp_adapter/              # ACP server (VS Code / Zed / JetBrains)
 ├── cron/                     # Scheduler (jobs.py, scheduler.py)
 ├── plugins/memory/           # Memory provider plugins
 ├── plugins/context_engine/   # Context engine plugins
-├── environments/             # RL training environments (Atropos)
 ├── skills/                   # Bundled skills (always available)
 ├── optional-skills/          # Official optional skills (install explicitly)
 ├── website/                  # Docusaurus documentation site
-└── tests/                    # Pytest suite (~3,000+ tests)
+└── tests/                    # Pytest suite (~25,000 tests across ~1,250 files)
 ```
 
 ## Data Flow
@@ -185,7 +186,6 @@ If you are new to the codebase:
 8. **[Gateway Internals](./gateway-internals.md)** — messaging platform gateway
 9. **[Context Compression & Prompt Caching](./context-compression-and-caching.md)** — compression and caching
 10. **[ACP Internals](./acp-internals.md)** — IDE integration
-11. **[Environments, Benchmarks & Data Generation](./environments.md)** — RL training
 
 ## Major Subsystems
 
@@ -199,7 +199,7 @@ The synchronous orchestration engine (`AIAgent` in `run_agent.py`). Handles prov
 
 Prompt construction and maintenance across the conversation lifecycle:
 
-- **`prompt_builder.py`** — Assembles the system prompt from: personality (SOUL.md), memory (MEMORY.md, USER.md), skills, context files (AGENTS.md, .hermes.md), tool-use guidance, and model-specific instructions
+- **`system_prompt.py` + `prompt_builder.py`** — assembles the ordered system-prompt tiers (`stable` → `context` → `volatile`): identity/tool guidance/skills, context files, then memory/profile/timestamp blocks
 - **`prompt_caching.py`** — Applies Anthropic cache breakpoints for prefix caching
 - **`context_compressor.py`** — Summarizes middle conversation turns when context exceeds thresholds
 
@@ -225,7 +225,7 @@ SQLite-based session storage with FTS5 full-text search. Sessions have lineage t
 
 ### Messaging Gateway
 
-Long-running process with 20 platform adapters, unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
+Long-running process with 25+ platform adapters (built-in + bundled plugins), unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
 
 → [Gateway Internals](./gateway-internals.md)
 
@@ -233,7 +233,7 @@ Long-running process with 20 platform adapters, unified session routing, user au
 
 Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Two specialized plugin types exist: memory providers (`plugins/memory/`) and context engines (`plugins/context_engine/`). Both are single-select — only one of each can be active at a time, configured via `hermes plugins` or `config.yaml`.
 
-→ [Plugin Guide](/docs/guides/build-a-hermes-plugin), [Memory Provider Plugin](./memory-provider-plugin.md)
+→ [Plugin Guide](/developer-guide/plugins), [Memory Provider Plugin](./memory-provider-plugin.md)
 
 ### Cron
 
@@ -247,11 +247,11 @@ Exposes Hermes as an editor-native agent over stdio/JSON-RPC for VS Code, Zed, a
 
 → [ACP Internals](./acp-internals.md)
 
-### RL / Environments / Trajectories
+### Trajectories
 
-Full environment framework for evaluation and RL training. Integrates with Atropos, supports multiple tool-call parsers, and generates ShareGPT-format trajectories.
+Generates ShareGPT-format trajectories from agent sessions for training data generation.
 
-→ [Environments, Benchmarks & Data Generation](./environments.md), [Trajectories & Training Format](./trajectory-format.md)
+→ [Trajectories & Training Format](./trajectory-format.md)
 
 ## Design Principles
 

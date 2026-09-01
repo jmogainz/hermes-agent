@@ -35,6 +35,30 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -49,8 +73,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
 )
-from gateway.session import SessionSource
-from gateway.config import PlatformConfig, Platform
+from gateway.config import Platform
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +131,19 @@ class IRCAdapter(BasePlatformAdapter):
 
         # Connection settings (env vars override config.yaml)
         self.server = os.getenv("IRC_SERVER") or extra.get("server", "")
-        self.port = int(os.getenv("IRC_PORT") or extra.get("port", 6697))
+        try:
+            self.port = int(os.getenv("IRC_PORT") or extra.get("port", 6697))
+        except (ValueError, TypeError):
+            self.port = 6697
         self.nickname = os.getenv("IRC_NICKNAME") or extra.get("nickname", "hermes-bot")
         self.channel = os.getenv("IRC_CHANNEL") or extra.get("channel", "")
         self.use_tls = (
-            os.getenv("IRC_USE_TLS", "").lower() in ("1", "true", "yes")
+            os.getenv("IRC_USE_TLS", "").lower() in {"1", "true", "yes"}
             if os.getenv("IRC_USE_TLS")
             else extra.get("use_tls", True)
         )
-        self.server_password = os.getenv("IRC_SERVER_PASSWORD") or extra.get("server_password", "")
-        self.nickserv_password = os.getenv("IRC_NICKSERV_PASSWORD") or extra.get("nickserv_password", "")
+        self.server_password = _get_scoped_secret("IRC_SERVER_PASSWORD") or extra.get("server_password", "")
+        self.nickserv_password = _get_scoped_secret("IRC_NICKSERV_PASSWORD") or extra.get("nickserv_password", "")
 
         # Auth
         self.allowed_users: list = extra.get("allowed_users", [])
@@ -150,7 +176,7 @@ class IRCAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the IRC server, register, and join the channel."""
         if not self.server or not self.channel:
             logger.error("IRC: server and channel must be configured")
@@ -215,6 +241,8 @@ class IRCAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         logger.info("IRC: connected to %s:%s as %s, joined %s", self.server, self.port, self._current_nick, self.channel)
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -680,13 +708,13 @@ def _env_enablement() -> dict | None:
         seed["nickname"] = nickname
     use_tls = os.getenv("IRC_USE_TLS", "").strip().lower()
     if use_tls:
-        seed["use_tls"] = use_tls in ("1", "true", "yes")
+        seed["use_tls"] = use_tls in {"1", "true", "yes"}
     # Passwords live in PlatformConfig.extra as well for back-compat with
     # existing config.yaml users; env-reads at construct time still win.
-    if os.getenv("IRC_SERVER_PASSWORD"):
-        seed["server_password"] = os.getenv("IRC_SERVER_PASSWORD")
-    if os.getenv("IRC_NICKSERV_PASSWORD"):
-        seed["nickserv_password"] = os.getenv("IRC_NICKSERV_PASSWORD")
+    if _get_scoped_secret("IRC_SERVER_PASSWORD"):
+        seed["server_password"] = _get_scoped_secret("IRC_SERVER_PASSWORD")
+    if _get_scoped_secret("IRC_NICKSERV_PASSWORD"):
+        seed["nickserv_password"] = _get_scoped_secret("IRC_NICKSERV_PASSWORD")
     # Optional home-channel (usually the same as IRC_CHANNEL, but can be a
     # dedicated reports channel).  Defaults to IRC_CHANNEL so cron jobs
     # with ``deliver=irc`` have a sensible target without extra config.
@@ -756,12 +784,12 @@ async def _standalone_send(
     nickname = os.getenv("IRC_NICKNAME") or extra.get("nickname", "hermes-bot")
     use_tls_env = os.getenv("IRC_USE_TLS")
     if use_tls_env is not None:
-        use_tls = use_tls_env.lower() in ("1", "true", "yes")
+        use_tls = use_tls_env.lower() in {"1", "true", "yes"}
     else:
         use_tls = bool(extra.get("use_tls", True))
 
-    server_password = os.getenv("IRC_SERVER_PASSWORD") or extra.get("server_password", "")
-    nickserv_password = os.getenv("IRC_NICKSERV_PASSWORD") or extra.get("nickserv_password", "")
+    server_password = _get_scoped_secret("IRC_SERVER_PASSWORD") or extra.get("server_password", "")
+    nickserv_password = _get_scoped_secret("IRC_NICKSERV_PASSWORD") or extra.get("nickserv_password", "")
 
     # Reject control characters in chat_id to block IRC command injection.
     raw_target = chat_id or channel
@@ -821,7 +849,7 @@ async def _standalone_send(
                 await _raw(f"PONG :{payload}")
             elif cmd == "001":
                 registered = True
-            elif cmd in ("432", "433"):
+            elif cmd in {"432", "433"}:
                 nick_attempts += 1
                 if nick_attempts > max_nick_attempts:
                     return {"error": "IRC standalone send: too many nick collisions"}
@@ -829,7 +857,7 @@ async def _standalone_send(
                 # mutated value, so the suffix stays bounded.
                 standalone_nick = f"{nick_base}-cron-{nick_attempts}"[:30]
                 await _raw(f"NICK {standalone_nick}")
-            elif cmd in ("464", "465"):
+            elif cmd in {"464", "465"}:
                 return {"error": f"IRC standalone send: server rejected client ({cmd})"}
 
         if nickserv_password:
@@ -860,9 +888,9 @@ async def _standalone_send(
                 if jcmd == "PING":
                     payload = jmsg["params"][0] if jmsg["params"] else ""
                     await _raw(f"PONG :{payload}")
-                elif jcmd in ("366", "JOIN"):
+                elif jcmd in {"366", "JOIN"}:
                     joined = True
-                elif jcmd in ("403", "405", "471", "473", "474", "475"):
+                elif jcmd in {"403", "405", "471", "473", "474", "475"}:
                     return {"error": f"IRC standalone send: JOIN {target} rejected ({jcmd})"}
 
         # Bytes-aware per-line splitting so multi-line plain text never

@@ -425,7 +425,7 @@ def _mac_audio_device_index(device_name: str) -> str:
         out = _sp.run(
             ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
         )
     except Exception:
@@ -447,7 +447,7 @@ def _mac_audio_device_index(device_name: str) -> str:
 def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
     url = os.environ.get("HERMES_MEET_URL", "").strip()
     out_dir_env = os.environ.get("HERMES_MEET_OUT_DIR", "").strip()
-    headed = os.environ.get("HERMES_MEET_HEADED", "").lower() in ("1", "true", "yes")
+    headed = os.environ.get("HERMES_MEET_HEADED", "").lower() in {"1", "true", "yes"}
     auth_state = os.environ.get("HERMES_MEET_AUTH_STATE", "").strip()
     guest_name = os.environ.get("HERMES_MEET_GUEST_NAME", "Hermes Agent")
     duration_s = _parse_duration(os.environ.get("HERMES_MEET_DURATION", ""))
@@ -456,6 +456,10 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
     realtime_model = os.environ.get("HERMES_MEET_REALTIME_MODEL", "gpt-realtime")
     realtime_voice = os.environ.get("HERMES_MEET_REALTIME_VOICE", "alloy")
     realtime_instructions = os.environ.get("HERMES_MEET_REALTIME_INSTRUCTIONS", "")
+    # HERMES_MEET_REALTIME_KEY is set explicitly by process_manager.start(),
+    # which resolves it through the parent's profile secret scope at spawn
+    # time. The bare OPENAI_API_KEY fallback only serves standalone
+    # `python -m plugins.google_meet.meet_bot` runs outside the gateway.
     realtime_api_key = os.environ.get("HERMES_MEET_REALTIME_KEY") or os.environ.get("OPENAI_API_KEY", "")
 
     if not url or not _is_safe_meet_url(url):
@@ -699,7 +703,13 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
             context.close()
             browser.close()
-            # v2: teardown realtime speaker + audio bridge.
+            # v2: teardown PCM pump, speaker thread, and audio bridge.
+            if rt.get("pcm_pump"):
+                try:
+                    rt["pcm_pump"].terminate()
+                    rt["pcm_pump"].wait(timeout=3)
+                except Exception:
+                    pass
             if rt["speaker_stop"]:
                 try:
                     rt["speaker_stop"]()
@@ -808,7 +818,7 @@ def _looks_like_human_speaker(speaker: str, bot_guest_name: str) -> bool:
     if not speaker or not speaker.strip():
         return False
     spk = speaker.strip().lower()
-    if spk in ("unknown", "you", bot_guest_name.strip().lower()):
+    if spk in {"unknown", "you", bot_guest_name.strip().lower()}:
         return False
     return True
 
