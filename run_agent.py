@@ -477,6 +477,8 @@ class AIAgent:
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
+        website_login_callback: callable = None,
+        native_component_callback: callable = None,
         read_terminal_callback: callable = None,
         read_preview_callback: callable = None,
         drive_preview_callback: callable = None,
@@ -568,6 +570,8 @@ class AIAgent:
             thinking_callback=thinking_callback,
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
+            website_login_callback=website_login_callback,
+            native_component_callback=native_component_callback,
             read_terminal_callback=read_terminal_callback,
             read_preview_callback=read_preview_callback,
             drive_preview_callback=drive_preview_callback,
@@ -6820,6 +6824,76 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
+    def handle_native_component_response(self, content: Any) -> dict[str, Any] | None:
+        """Parse/canonicalize one model-authored native component marker.
+
+        Returns ``None`` when the response has no marker.  When a marker is
+        present, ``handled`` is true even if validation failed, so callers can
+        avoid displaying the raw marker.  Browser targets and capabilities are
+        always sourced from the in-process runtime registry, never from the
+        model response.
+        """
+        from agent.native_component_protocol import MARKER_OPEN, extract_native_component
+
+        if not isinstance(content, str) or MARKER_OPEN not in content:
+            return None
+        clean_text, candidate = extract_native_component(content)
+        if candidate is None:
+            return {"handled": True, "valid": False, "clean_text": clean_text, "component": None}
+        runtime = getattr(self, "native_auth_runtime", None)
+        if runtime is None:
+            from tools.native_auth_runtime import native_auth_runtime as runtime
+
+            self.native_auth_runtime = runtime
+        try:
+            component = runtime.prepare_component(
+                candidate,
+                task_id=str(getattr(self, "session_id", None) or ""),
+            )
+        except Exception:
+            return {"handled": True, "valid": False, "clean_text": clean_text, "component": None}
+        callback = getattr(self, "native_component_callback", None)
+        if callable(callback):
+            try:
+                callback(component)
+            except Exception:
+                logger.debug("native_component_callback error", exc_info=True)
+        return {"handled": True, "valid": True, "clean_text": clean_text, "component": component}
+
+    def wait_for_native_component(self, component_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+        runtime = getattr(self, "native_auth_runtime", None)
+        if runtime is None:
+            from tools.native_auth_runtime import native_auth_runtime as runtime
+
+            self.native_auth_runtime = runtime
+        return runtime.wait_for_component(
+            component_id,
+            task_id=str(getattr(self, "session_id", None) or ""),
+            timeout=timeout,
+        )
+
+    def submit_native_auth_envelope(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        runtime = getattr(self, "native_auth_runtime", None)
+        if runtime is None:
+            from tools.native_auth_runtime import native_auth_runtime as runtime
+
+            self.native_auth_runtime = runtime
+        return runtime.submit_envelope(
+            envelope,
+            task_id=str(getattr(self, "session_id", None) or ""),
+        )
+
+    def cancel_native_component(self, component_id: str) -> dict[str, Any]:
+        runtime = getattr(self, "native_auth_runtime", None)
+        if runtime is None:
+            from tools.native_auth_runtime import native_auth_runtime as runtime
+
+            self.native_auth_runtime = runtime
+        return runtime.cancel_context(
+            component_id,
+            task_id=str(getattr(self, "session_id", None) or ""),
+        )
+
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
 
@@ -6854,6 +6928,12 @@ class AIAgent:
             self._stream_writer_token += 1
             token = self._stream_writer_token
         self._stream_writer_tls.token = token
+        native_filter = getattr(self, "_native_component_stream_filter", None)
+        if native_filter is not None:
+            try:
+                native_filter.flush()
+            except Exception:
+                self._native_component_stream_filter = None
         return token
 
     def _stream_writer_is_current(self, token: int) -> bool:
@@ -6967,7 +7047,24 @@ class AIAgent:
             else:
                 # Defensive: legacy callers without the scrubber attribute.
                 text = sanitize_context(text)
-            # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
+            # Native component requests are parsed only after the complete
+            # assistant response is available, but providers may stream that
+            # response first. Keep the marker and its JSON out of every visible
+            # delta while preserving ordinary text around it.
+            try:
+                from agent.native_component_protocol import NativeComponentStreamFilter
+
+                native_filter = getattr(self, "_native_component_stream_filter", None)
+                if native_filter is None:
+                    native_filter = NativeComponentStreamFilter()
+                    self._native_component_stream_filter = native_filter
+                text = native_filter.feed(text)
+            except Exception:
+                # The security default for a missing filter is to suppress the
+                # suspicious marker-bearing delta rather than display it.
+                if isinstance(text, str) and "<semreh.native-component>" in text:
+                    text = ""
+
             if not prepended_break and not getattr(
                 self, "_current_streamed_assistant_text", ""
             ):

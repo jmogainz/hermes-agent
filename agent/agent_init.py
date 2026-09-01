@@ -568,6 +568,8 @@ def init_agent(
     thinking_callback: callable = None,
     reasoning_callback: callable = None,
     clarify_callback: callable = None,
+    website_login_callback: callable = None,
+    native_component_callback: callable = None,
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
     drive_preview_callback: callable = None,
@@ -644,6 +646,7 @@ def init_agent(
         tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
         clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
+        website_login_callback (callable): Metadata-only native Work Mode callback. If None, website_login fails closed.
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
         reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
             If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
@@ -867,6 +870,17 @@ def init_agent(
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
+    agent.website_login_callback = website_login_callback
+    agent.native_component_callback = native_component_callback
+    try:
+        from tools.native_auth_runtime import native_auth_runtime as _native_auth_runtime
+
+        _native_auth_runtime.register_component_callback(
+            str(session_id or getattr(agent, "session_id", "") or ""),
+            native_component_callback,
+        )
+    except Exception:
+        logger.debug("native auth callback registration failed", exc_info=True)
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
     agent.drive_preview_callback = drive_preview_callback

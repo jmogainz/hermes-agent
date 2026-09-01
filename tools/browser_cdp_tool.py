@@ -392,6 +392,32 @@ def _browser_cdp_via_supervisor(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _native_auth_cdp_guard(task_id: str, method: str) -> Optional[str]:
+    """Block model CDP page mutations while a native auth component is pending."""
+    if method in {"Target.getTargets", "Target.getTargetInfo", "Browser.getVersion"}:
+        return None
+    try:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        blocked = native_auth_runtime.model_browser_mutation_guard(
+            task_id,
+            action=f"CDP {method}",
+        )
+    except Exception:
+        logger.exception("native auth CDP guard unavailable")
+        blocked = "auth_boundary_required: native authentication guard unavailable"
+    if not blocked:
+        return None
+    return json.dumps(
+        {
+            "success": False,
+            "error": blocked,
+            "auth_boundary_required": True,
+        },
+        ensure_ascii=False,
+    )
+
+
 def browser_cdp(
     method: str,
     params: Optional[Dict[str, Any]] = None,
@@ -426,6 +452,16 @@ def browser_cdp(
         success, or ``{"error": "..."}`` on failure.
     """
     effective_task_id = task_id or "default"
+
+    if not method or not isinstance(method, str):
+        return tool_error(
+            "'method' is required (e.g. 'Target.getTargets')",
+            cdp_docs=CDP_DOCS_URL,
+        )
+
+    native_blocked = _native_auth_cdp_guard(effective_task_id, method)
+    if native_blocked is not None:
+        return native_blocked
 
     # --- Route iframe-scoped calls through the supervisor ---------------
     if frame_id:

@@ -56,6 +56,7 @@ import logging
 import os
 import signal
 import re
+import secrets
 import subprocess
 import shutil
 import sys
@@ -2056,6 +2057,67 @@ _cleanup_running = False
 # Protects _session_last_activity AND _active_sessions for thread safety
 # (subagents run concurrently via ThreadPoolExecutor)
 _cleanup_lock = threading.Lock()
+_browser_holds_lock = threading.Lock()
+_browser_session_holds: Dict[str, Dict[str, float]] = {}
+_browser_hold_tokens: Dict[str, str] = {}
+
+
+def acquire_browser_session_hold(session_key: str, *, expires_at: float) -> str:
+    """Pin one exact named provider session until an absolute prompt expiry."""
+    if (
+        not isinstance(session_key, str)
+        or not session_key.startswith("bu-named-ha1-")
+        or len(session_key) > 128
+    ):
+        raise ValueError("invalid browser session hold key")
+    try:
+        deadline = float(expires_at)
+    except (TypeError, ValueError):
+        raise ValueError("invalid browser session hold expiry") from None
+    if deadline <= 0 or deadline == float("inf") or deadline != deadline:
+        raise ValueError("invalid browser session hold expiry")
+    token = secrets.token_urlsafe(24)
+    with _browser_holds_lock:
+        _browser_session_holds.setdefault(session_key, {})[token] = deadline
+        _browser_hold_tokens[token] = session_key
+    return token
+
+
+def release_browser_session_hold(token: str) -> None:
+    """Idempotently release one provider-session hold token."""
+    if not isinstance(token, str):
+        return
+    with _browser_holds_lock:
+        session_key = _browser_hold_tokens.pop(token, None)
+        if session_key is None:
+            return
+        holds = _browser_session_holds.get(session_key)
+        if holds is None:
+            return
+        holds.pop(token, None)
+        if not holds:
+            _browser_session_holds.pop(session_key, None)
+
+
+def _browser_session_hold_active(
+    session_key: str,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Return whether any unexpired token currently pins ``session_key``."""
+    current = time.time() if now is None else float(now)
+    with _browser_holds_lock:
+        holds = _browser_session_holds.get(session_key)
+        if not holds:
+            return False
+        expired = [token for token, deadline in holds.items() if deadline <= current]
+        for token in expired:
+            holds.pop(token, None)
+            _browser_hold_tokens.pop(token, None)
+        if not holds:
+            _browser_session_holds.pop(session_key, None)
+            return False
+        return True
 
 
 def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
@@ -2158,7 +2220,14 @@ def _cleanup_inactive_browser_sessions():
 
     with _cleanup_lock:
         for task_id, last_time in list(_session_last_activity.items()):
-            if current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT:
+            session_info = _active_sessions.get(task_id)
+            provider_expired = bool(
+                session_info and _session_has_expired(session_info, now=current_time)
+            )
+            inactive = current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT
+            if provider_expired or (
+                inactive and not _browser_session_hold_active(task_id, now=current_time)
+            ):
                 sessions_to_cleanup.append(task_id)
 
     for task_id in sessions_to_cleanup:
@@ -2539,7 +2608,7 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating. If the page presents a sign-in, passkey, MFA, SSO, or OIDC wall, stop browser credential actions. Use the sanitized `auth_context` in the browser result to emit exactly one bounded `<semreh.native-component>` marker with its `context_id`, then wait for opaque native-component state; never put credentials, OTPs, cookies, or form values in browser tool calls.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2553,7 +2622,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content. If the snapshot shows a sign-in, passkey, MFA, SSO, or OIDC wall, stop browser credential actions. Use the sanitized `auth_context` from the latest browser result to emit exactly one bounded `<semreh.native-component>` marker with its `context_id`, then wait for opaque native-component state; never put credentials, OTPs, cookies, or form values in browser tool calls.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2582,7 +2651,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type non-secret text into an input field identified by its ref ID. Clears the field first, then types the new text. Never type passwords, passcodes, OTPs, passkeys, API keys, cookies, tokens, or other credentials. If the field is part of a sign-in, MFA, SSO, or OIDC flow, stop and emit the bounded `<semreh.native-component>` marker from the browser's sanitized `auth_context`; do not use a legacy login tool. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3931,7 +4000,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
     # cloud provider never sees the URL in that case.  Can also be opted
     # out globally via ``browser.allow_private_urls`` in config.
+    # A pending native component owns the current browser page until the
+    # user completes or cancels it. Do not let model navigation invalidate
+    # browser-issued targets mid-handshake.
     effective_task_id = task_id or "default"
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "navigation")
+    if native_blocked is not None:
+        return native_blocked
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
@@ -4239,11 +4314,14 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    effective_task_id = _last_session_key(task_id or "default")
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "click")
+    if native_blocked is not None:
+        return native_blocked
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "click")
     if blocked is not None:
         return blocked
@@ -4280,18 +4358,40 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    effective_task_id = _last_session_key(task_id or "default")
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "type")
+    if native_blocked is not None:
+        return native_blocked
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "type")
     if blocked is not None:
         return blocked
-
-    # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
+    try:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        auth_guard = native_auth_runtime.model_action_guard(
+            effective_task_id,
+            ref,
+            action="type",
+        )
+        if auth_guard:
+            return json.dumps({
+                "success": False,
+                "error": auth_guard,
+                "auth_boundary_required": True,
+            }, ensure_ascii=False)
+    except Exception:
+        logger.exception("native auth model-type guard unavailable")
+        return json.dumps({
+            "success": False,
+            "error": "auth_boundary_required: native authentication guard unavailable",
+            "auth_boundary_required": True,
+        }, ensure_ascii=False)
 
     # Use fill command (clears then types)
     result = _run_browser_command(effective_task_id, "fill", [ref, text])
@@ -4344,6 +4444,11 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             "error": f"Invalid direction '{direction}'. Use 'up' or 'down'."
         }, ensure_ascii=False)
 
+    effective_task_id = _last_session_key(task_id or "default")
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "scroll")
+    if native_blocked is not None:
+        return native_blocked
+
     # Single scroll with pixel amount instead of 5x subprocess calls.
     # agent-browser supports: agent-browser scroll down 500
     # ~500px is roughly half a viewport of travel.
@@ -4357,8 +4462,6 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         for _ in range(_SCROLL_REPEATS):
             result = camofox_scroll(direction, task_id)
         return result
-
-    effective_task_id = _last_session_key(task_id or "default")
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
@@ -4385,11 +4488,15 @@ def browser_back(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result
     """
+    effective_task_id = _last_session_key(task_id or "default")
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "back navigation")
+    if native_blocked is not None:
+        return native_blocked
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "back", [])
 
     if result.get("success"):
@@ -4437,11 +4544,14 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    effective_task_id = _last_session_key(task_id or "default")
+    native_blocked = _native_auth_mutation_guard(effective_task_id, "press")
+    if native_blocked is not None:
+        return native_blocked
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
 
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_action(effective_task_id, "press")
     if blocked is not None:
         return blocked
@@ -4459,6 +4569,30 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
             "error": result.get("error", f"Failed to press {key}")
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+def _native_auth_mutation_guard(effective_task_id: str, action: str) -> Optional[str]:
+    """Return an opaque block when model browser mutation must pause for auth."""
+    try:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        blocked = native_auth_runtime.model_browser_mutation_guard(
+            effective_task_id,
+            action=action,
+        )
+    except Exception:
+        logger.exception("native auth mutation guard unavailable")
+        blocked = "auth_boundary_required: native authentication guard unavailable"
+    if not blocked:
+        return None
+    return json.dumps(
+        {
+            "success": False,
+            "error": blocked,
+            "auth_boundary_required": True,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _blocked_private_page_action(effective_task_id: str, action: str) -> Optional[str]:
@@ -4495,6 +4629,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     """
     # --- JS evaluation mode ---
     if expression is not None:
+        effective_task_id = _last_session_key(task_id or "default")
+        native_blocked = _native_auth_mutation_guard(effective_task_id, "JavaScript evaluation")
+        if native_blocked is not None:
+            return native_blocked
         policy_error = _enforce_browser_eval_policy(expression)
         if policy_error:
             return json.dumps({"success": False, "error": policy_error}, ensure_ascii=False)

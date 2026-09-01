@@ -87,6 +87,26 @@ def browser_dialog(
 ) -> str:
     """Respond to a pending dialog on the active task's CDP supervisor."""
     effective_task_id = task_id or "default"
+    try:
+        from tools.native_auth_runtime import native_auth_runtime
+
+        native_blocked = native_auth_runtime.model_browser_mutation_guard(
+            effective_task_id,
+            action="dialog response",
+        )
+    except Exception:
+        logger.exception("native auth dialog guard unavailable")
+        native_blocked = "auth_boundary_required: native authentication guard unavailable"
+    if native_blocked:
+        return json.dumps(
+            {
+                "success": False,
+                "error": native_blocked,
+                "auth_boundary_required": True,
+            },
+            ensure_ascii=False,
+        )
+
     supervisor = SUPERVISOR_REGISTRY.get(effective_task_id)
     if supervisor is None:
         return json.dumps(

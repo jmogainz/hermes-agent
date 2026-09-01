@@ -186,8 +186,14 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "browser_dialog", "browser_exec", "web_search"
+            "browser_dialog", "browser_exec", "native_auth", "web_search"
         ],
+        "includes": []
+    },
+
+    "work_mode": {
+        "description": "Native auth is delivered as a secure component by the active browser runtime",
+        "tools": [],
         "includes": []
     },
     

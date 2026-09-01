@@ -47,6 +47,25 @@ class TestDeadCodeRemoval:
         assert "browser_close" not in names
 
 
+class TestNativeAuthComponentGuidance:
+    """Browser schemas route login walls to the native component boundary."""
+
+    def test_browser_auth_wall_guidance_points_to_native_component(self):
+        from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+
+        schemas = {schema["name"]: schema for schema in BROWSER_TOOL_SCHEMAS}
+        for name in ("browser_navigate", "browser_snapshot", "browser_type"):
+            description = schemas[name]["description"].lower()
+            assert "native" in description
+            assert "semreh.native-component" in description
+            assert "website_login" not in description
+        assert "never" in schemas["browser_type"]["description"].lower()
+
+    def test_legacy_website_login_is_not_an_active_tool(self):
+        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+
+        assert "website_login" not in _HERMES_CORE_TOOLS
+        assert "website_login" not in TOOLSETS["work_mode"]["tools"]
 # ---------------------------------------------------------------------------
 # Caching: _find_agent_browser
 # ---------------------------------------------------------------------------

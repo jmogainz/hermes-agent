@@ -13,7 +13,14 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
+import re
+import shlex
+import shutil
+import socket
 import stat
+import subprocess
+import tempfile
+import threading
 import time
 
 import pytest
@@ -35,6 +42,106 @@ def _fake_cli(tmp_path, body):
     script.write_text("#!/bin/sh\n" + body)
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return str(script)
+
+
+def _start_private_ipc_server(tmp_path, session, response, *, delay=0.0):
+    """Start one fake browser-harness AF_UNIX request/response exchange."""
+    runtime = tmp_path.__class__(tempfile.mkdtemp(prefix="bh-test-", dir="/tmp"))
+    runtime.chmod(0o700)
+    endpoint = runtime / f"bu-{session}.sock"
+    pid_path = runtime / f"bu-{session}.pid"
+    pid_path.write_text(str(os.getpid()))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(endpoint))
+    endpoint.chmod(0o600)
+    server.listen(1)
+    server.settimeout(1.0)
+    captured = []
+
+    def serve():
+        conn = None
+        try:
+            conn, _ = server.accept()
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            captured.append(data)
+            if delay:
+                time.sleep(delay)
+            conn.sendall(response + b"\n")
+        except OSError:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+            server.close()
+            try:
+                endpoint.unlink()
+                pid_path.unlink()
+                runtime.rmdir()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return runtime, endpoint, captured, thread
+
+
+def _start_harness_019_server(
+    tmp_path,
+    session,
+    handler,
+    *,
+    socket_mode=0o700,
+    pid=None,
+    max_connections=3,
+):
+    """Run a bounded server with browser-harness 0.1.9's wire/layout contract."""
+    runtime = tmp_path.__class__(tempfile.mkdtemp(prefix="bh-019-", dir="/tmp"))
+    runtime.chmod(0o700)
+    endpoint = runtime / f"bu-{session}.sock"
+    pid_path = runtime / f"bu-{session}.pid"
+    pid_path.write_text(str(pid if pid is not None else os.getpid()))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(endpoint))
+    endpoint.chmod(socket_mode)
+    server.listen(max_connections)
+    server.settimeout(0.5)
+    captured = []
+
+    def serve():
+        try:
+            for _ in range(max_connections):
+                try:
+                    conn, _ = server.accept()
+                except TimeoutError:
+                    break
+                with conn:
+                    data = b""
+                    while not data.endswith(b"\n"):
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                    request = json.loads(data)
+                    captured.append(request)
+                    response = handler(request)
+                    conn.sendall(json.dumps(response).encode() + b"\n")
+        finally:
+            server.close()
+            try:
+                endpoint.unlink()
+                pid_path.unlink()
+                runtime.rmdir()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return runtime, endpoint, captured, thread
 
 
 class TestModeDetection:
@@ -398,6 +505,31 @@ class TestBackendCdpResolution:
         assert bu_cli._resolve_backend_cdp(env, "t1") is None
         assert env["BU_CDP_URL"] == "http://127.0.0.1:9222"
 
+    def test_webui_thread_local_cdp_override_precedes_process_backend(
+        self, monkeypatch
+    ):
+        import sys
+        import types
+        import tools.browser_tool as bt
+
+        fake_api = types.ModuleType("api")
+        fake_config = types.ModuleType("api.config")
+        fake_config._thread_local_env_value = (
+            lambda name, default="": (
+                "http://127.0.0.1:9246"
+                if name == "HERMES_WEBUI_BROWSER_CDP_URL"
+                else default
+            )
+        )
+        monkeypatch.setitem(sys.modules, "api", fake_api)
+        monkeypatch.setitem(sys.modules, "api.config", fake_config)
+        monkeypatch.delenv("HERMES_WEBUI_BROWSER_CDP_URL", raising=False)
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "http://127.0.0.1:9222")
+
+        env = self._env()
+        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        assert env["BU_CDP_URL"] == "http://127.0.0.1:9246"
+
     def test_ws_override_uses_bu_cdp_ws(self, monkeypatch):
         import tools.browser_tool as bt
 
@@ -464,31 +596,66 @@ class TestBackendCdpResolution:
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
         monkeypatch.setattr(bt, "_get_session_info", fake_session_info)
+        monkeypatch.setattr(bu_cli, "_PROCESS_GENERATION", "provider-test-generation")
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME ws:$BU_CDP_WS"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
+        effective = bu_cli._effective_session_name("r7k2", None)
         assert result["success"] is True
-        assert seen == ["bu-named-r7k2"]
-        assert "bu:r7k2" in result["output"]
-        assert "ws:wss://browser.example/cdp/bu-named-r7k2" in result["output"]
+        assert seen == [f"bu-named-{effective}"]
+        assert f"bu:{effective}" in result["output"]
+        assert f"ws:wss://browser.example/cdp/bu-named-{effective}" in result["output"]
+        assert result["session"] == "r7k2"
 
-    def test_named_session_key_stable_across_tasks(self, monkeypatch):
-        """The same session name maps to the same provider cache key no
-        matter which task calls it — that is what lets a follow-up call
-        reattach to the same cloud browser."""
+    def test_effective_named_session_is_task_and_process_scoped(self):
+        same_a = bu_cli._effective_session_name("research", "task-A", process_generation="gen-1")
+        same_b = bu_cli._effective_session_name("research", "task-A", process_generation="gen-1")
+        other_task = bu_cli._effective_session_name("research", "task-B", process_generation="gen-1")
+        other_process = bu_cli._effective_session_name("research", "task-A", process_generation="gen-2")
+
+        assert same_a == same_b
+        assert same_a != other_task
+        assert same_a != other_process
+        assert same_a.startswith("ha1-")
+        assert len(same_a) <= 64
+        assert bu_cli._SESSION_RE.fullmatch(same_a)
+
+    def test_browser_exec_uses_effective_name_but_returns_requested_label(self, tmp_path, monkeypatch):
         import tools.browser_tool as bt
 
         seen = []
+        monkeypatch.setattr(bu_cli, "_PROCESS_GENERATION", "test-generation")
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
         monkeypatch.setattr(
-            bt, "_get_session_info",
+            bt,
+            "_get_session_info",
             lambda key: seen.append(key) or {"cdp_url": "wss://x/cdp/a"},
         )
-        env1, env2 = {}, {}
-        assert bu_cli._resolve_backend_cdp(env1, "task-A", session_name="research") is None
-        assert bu_cli._resolve_backend_cdp(env2, "task-B", session_name="research") is None
-        assert seen == ["bu-named-research", "bu-named-research"]
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "effective:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(
+            bu_cli.browser_exec(
+                "print(1)",
+                session="research",
+                task_id="task-A",
+                _internal_native_auth=True,
+                _disable_native_auth_probe=True,
+            )
+        )
+        effective = bu_cli._effective_session_name("research", "task-A")
+        assert seen == [f"bu-named-{effective}"]
+        assert f"effective:{effective}" in result["output"]
+        assert result["session"] == "research"
+        runtime = tmp_path / "runtime"
+        runtime.mkdir(mode=0o700)
+        runtime.chmod(0o700)
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+        monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+        resolved_runtime, stem = bu_cli._harness_runtime_layout(effective)
+        assert resolved_runtime == runtime.resolve()
+        assert resolved_runtime / f"{stem}.sock" == runtime.resolve() / f"bu-{effective}.sock"
 
     def test_named_session_direct_api_bu_cloud_still_skips_provider(
         self, tmp_path, monkeypatch
@@ -572,6 +739,302 @@ class TestOwnTabPreamble:
         ast.parse(bu_cli._OWN_TAB_PREAMBLE)
         # and composes with model code
         ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
+
+
+class TestOwnedBrowserUseDaemonLifecycle:
+    def test_register_and_task_cleanup_are_private_and_idempotent(self, tmp_path, monkeypatch):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir(mode=0o700)
+        runtime.chmod(0o700)
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+        monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {})
+        calls = []
+
+        def control(session, action, *, timeout_s=None):
+            calls.append((session, action))
+            return True
+
+        monkeypatch.setattr(bu_cli, "_private_daemon_control", control)
+        daemon_identity = (4242, ("sha256", "daemon-fingerprint"))
+        monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: daemon_identity)
+        name = "ha1-owned-session"
+        assert bu_cli._register_owned_daemon(name, "task-owned") is True
+        marker = runtime / f"{name}.owner.json"
+        assert marker.exists()
+        assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+        payload = json.loads(marker.read_text())
+        assert payload == {
+            "version": 2,
+            "session": name,
+            "task_id": "task-owned",
+            "owner_pid": os.getpid(),
+            "daemon_pid": daemon_identity[0],
+            "daemon_identity": list(daemon_identity[1]),
+        }
+
+        bu_cli.cleanup_browser_use_task("task-owned")
+        bu_cli.cleanup_browser_use_task("task-owned")
+        assert calls == [(name, "ping"), (name, "shutdown")]
+        assert not marker.exists()
+
+    @pytest.mark.parametrize("mutation", ["symlink", "mode", "owner_pid", "daemon_pid", "daemon_identity", "task", "session", "legacy", "malformed_version"])
+    def test_verify_native_auth_owner_rejects_untrusted_marker_variants(
+        self, tmp_path, monkeypatch, mutation
+    ):
+        name, task_id = "ha1-owned-session", "task-owned"
+        daemon_identity = (4242, ("sha256", "daemon-fingerprint"))
+        marker = tmp_path / f"{name}.owner.json"
+        payload = {
+            "version": 2, "session": name, "task_id": task_id,
+            "owner_pid": os.getpid(), "daemon_pid": daemon_identity[0],
+            "daemon_identity": list(daemon_identity[1]),
+        }
+        marker.write_text(json.dumps(payload))
+        marker.chmod(0o600)
+        if mutation == "symlink":
+            target = tmp_path / "marker-target.json"
+            target.write_text(json.dumps(payload))
+            target.chmod(0o600)
+            marker.unlink()
+            marker.symlink_to(target)
+        elif mutation == "mode":
+            marker.chmod(0o644)
+        elif mutation == "daemon_pid":
+            payload["daemon_pid"] += 1
+            marker.write_text(json.dumps(payload))
+        elif mutation == "owner_pid":
+            payload["owner_pid"] += 1
+            marker.write_text(json.dumps(payload))
+        elif mutation == "daemon_identity":
+            payload["daemon_identity"] = ["sha256", "wrong"]
+            marker.write_text(json.dumps(payload))
+        elif mutation == "task":
+            payload["task_id"] = "other-task"
+            marker.write_text(json.dumps(payload))
+        elif mutation == "session":
+            payload["session"] = "ha1-other-session"
+            marker.write_text(json.dumps(payload))
+        elif mutation == "legacy":
+            payload = {"version": 1, "session": name, "task_id": task_id, "owner_pid": os.getpid()}
+            marker.write_text(json.dumps(payload))
+        elif mutation == "malformed_version":
+            payload["version"] = "2"
+            marker.write_text(json.dumps(payload))
+
+        monkeypatch.setattr(bu_cli, "_effective_session_name", lambda *_a, **_k: name)
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {name: task_id})
+        monkeypatch.setattr(bu_cli, "_owned_daemon_marker", lambda _session: marker)
+        monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: daemon_identity)
+        monkeypatch.setattr(bu_cli, "_private_daemon_control", lambda *_a, **_k: pytest.fail("fallback ping must not authorize"))
+        assert bu_cli._verify_native_auth_owner(name, task_id) is False
+
+    def test_verify_native_auth_owner_accepts_exact_regular_marker(self, tmp_path, monkeypatch):
+        name, task_id = "ha1-owned-session", "task-owned"
+        daemon_identity = (4242, ("sha256", "daemon-fingerprint"))
+        marker = tmp_path / f"{name}.owner.json"
+        marker.write_text(json.dumps({
+            "version": 2, "session": name, "task_id": task_id,
+            "owner_pid": os.getpid(), "daemon_pid": daemon_identity[0],
+            "daemon_identity": list(daemon_identity[1]),
+        }))
+        marker.chmod(0o600)
+        monkeypatch.setattr(bu_cli, "_effective_session_name", lambda *_a, **_k: name)
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {name: task_id})
+        monkeypatch.setattr(bu_cli, "_owned_daemon_marker", lambda _session: marker)
+        monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: daemon_identity)
+        assert bu_cli._verify_native_auth_owner(name, task_id) is True
+
+    def test_verify_native_auth_owner_rejects_symlink_when_nofollow_is_unavailable(self, tmp_path, monkeypatch):
+        name, task_id = "ha1-owned-session", "task-owned"
+        daemon_identity = (4242, ("sha256", "daemon-fingerprint"))
+        target = tmp_path / "marker-target.json"
+        target.write_text(json.dumps({
+            "version": 2, "session": name, "task_id": task_id,
+            "owner_pid": os.getpid(), "daemon_pid": daemon_identity[0],
+            "daemon_identity": list(daemon_identity[1]),
+        }))
+        target.chmod(0o600)
+        marker = tmp_path / f"{name}.owner.json"
+        marker.symlink_to(target)
+
+        # Model a platform without O_NOFOLLOW and an ineffective open boundary:
+        # the path lookup and open both resolve the symlink target.
+        real_open = os.open
+        monkeypatch.delattr(bu_cli.os, "O_NOFOLLOW", raising=False)
+        monkeypatch.setattr(type(marker), "lstat", lambda _path: target.stat())
+        monkeypatch.setattr(bu_cli.os, "open", lambda _path, _flags: real_open(target, os.O_RDONLY))
+        monkeypatch.setattr(bu_cli, "_effective_session_name", lambda *_a, **_k: name)
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {name: task_id})
+        monkeypatch.setattr(bu_cli, "_owned_daemon_marker", lambda _session: marker)
+        monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: daemon_identity)
+
+        assert bu_cli._verify_native_auth_owner(name, task_id) is False
+
+    @pytest.mark.parametrize("daemon_identity", [
+        ["sha256", True],
+        ["sha256"],
+        "sha256:daemon-fingerprint",
+        {"algorithm": "sha256", "value": "daemon-fingerprint"},
+    ])
+    def test_verify_native_auth_owner_rejects_non_exact_daemon_identity_types(
+        self, tmp_path, monkeypatch, daemon_identity
+    ):
+        name, task_id = "ha1-owned-session", "task-owned"
+        live_identity = (4242, ("sha256", 1))
+        marker = tmp_path / f"{name}.owner.json"
+        marker.write_text(json.dumps({
+            "version": 2, "session": name, "task_id": task_id,
+            "owner_pid": os.getpid(), "daemon_pid": live_identity[0],
+            "daemon_identity": daemon_identity,
+        }))
+        marker.chmod(0o600)
+        monkeypatch.setattr(bu_cli, "_effective_session_name", lambda *_a, **_k: name)
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {name: task_id})
+        monkeypatch.setattr(bu_cli, "_owned_daemon_marker", lambda _session: marker)
+        monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: live_identity)
+
+        assert bu_cli._verify_native_auth_owner(name, task_id) is False
+
+
+    def test_native_auth_descriptor_fails_closed_for_aria_disabled_and_readonly(self):
+        descriptor = bu_cli._NATIVE_AUTH_V2_DESCRIPTOR_FUNCTION
+        disabled_check = re.compile(r"getAttribute\(['\"]aria-disabled['\"]\)\s*===\s*['\"]true['\"]")
+        readonly_check = re.compile(r"this\.readOnly\s*===\s*true")
+        eligibility_return = "return {eligible:true"
+        disabled_match = disabled_check.search(descriptor)
+        readonly_match = readonly_check.search(descriptor)
+        assert disabled_match
+        assert readonly_match
+        assert disabled_match.start() < descriptor.index(eligibility_return)
+        assert readonly_match.start() < descriptor.index(eligibility_return)
+
+    def test_native_auth_descriptor_rejects_disabled_ancestors_and_nonfillable_roles(self):
+        descriptor = bu_cli._NATIVE_AUTH_V2_DESCRIPTOR_FUNCTION
+        for guard in (
+            "this.closest('[aria-disabled=\"true\"]')",
+            "this.closest('[inert]')",
+            "this.closest('fieldset:disabled')",
+        ):
+            assert guard in descriptor
+            assert descriptor.index(guard) < descriptor.index("return {eligible:true")
+
+        # A role alone must not turn an arbitrary non-editable element into a
+        # fill target; native editable controls remain the eligible cases.
+        assert re.search(
+            r"role\s*===\s*['\"]textbox['\"]\s*&&\s*!\s*\([^)]*HTMLInputElement",
+            descriptor,
+        )
+        assert "HTMLTextAreaElement" in descriptor
+        assert "isContentEditable" in descriptor
+
+    def test_native_auth_descriptor_role_and_ancestor_contract_in_dom_harness(self):
+        if not shutil.which("node"):
+            pytest.skip("node is required for the browser-side descriptor contract probe")
+
+        function_declaration = json.dumps(bu_cli._NATIVE_AUTH_V2_DESCRIPTOR_FUNCTION)
+        harness = f"""
+global.document = {{}};
+global.getComputedStyle = () => ({{display: 'block', visibility: 'visible'}});
+class Element {{
+  constructor({{role = '', editable = false, ancestors = []}} = {{}}) {{
+    this.isConnected = true;
+    this.ownerDocument = global.document;
+    this.disabled = false;
+    this.readOnly = false;
+    this.hidden = false;
+    this.required = false;
+    this.textContent = '';
+    this.isContentEditable = editable;
+    this._role = role;
+    this._ancestors = ancestors;
+  }}
+  getAttribute(name) {{
+    if (name === 'role') return this._role || null;
+    return null;
+  }}
+  hasAttribute() {{ return false; }}
+  getBoundingClientRect() {{ return {{width: 10, height: 10}}; }}
+  closest(selector) {{
+    return this._ancestors.find((ancestor) =>
+      (selector.includes('[aria-disabled="true"]') && ancestor.ariaDisabled) ||
+      (selector.includes('[inert]') && ancestor.inert) ||
+      (selector.includes('fieldset:disabled') && ancestor.fieldsetDisabled)
+    ) || null;
+  }}
+}}
+class HTMLInputElement extends Element {{
+  constructor(options = {{}}) {{ super(options); this.type = 'text'; }}
+}}
+class HTMLTextAreaElement extends Element {{
+  constructor(options = {{}}) {{ super(options); }}
+}}
+class HTMLSelectElement extends Element {{}}
+class HTMLButtonElement extends Element {{}}
+class HTMLAnchorElement extends Element {{}}
+global.Element = Element;
+global.HTMLInputElement = HTMLInputElement;
+global.HTMLTextAreaElement = HTMLTextAreaElement;
+global.HTMLSelectElement = HTMLSelectElement;
+global.HTMLButtonElement = HTMLButtonElement;
+global.HTMLAnchorElement = HTMLAnchorElement;
+const fn = eval('(' + {function_declaration} + ')');
+const inspect = (element) => {{
+  try {{ return fn.call(element).eligible === true; }}
+  catch (_error) {{ return 'error'; }}
+}};
+const ancestor = (key) => [{{[key]: true}}];
+const result = {{
+  arbitraryRoleTextbox: inspect(new Element({{role: 'textbox'}})),
+  ariaDisabledAncestor: inspect(new HTMLInputElement({{ancestors: ancestor('ariaDisabled')}})),
+  inertAncestor: inspect(new HTMLInputElement({{ancestors: ancestor('inert')}})),
+  disabledFieldsetAncestor: inspect(new HTMLInputElement({{ancestors: ancestor('fieldsetDisabled')}})),
+  input: inspect(new HTMLInputElement()),
+  textarea: inspect(new HTMLTextAreaElement()),
+  contenteditable: inspect(new Element({{editable: true}})),
+}};
+process.stdout.write(JSON.stringify(result));
+"""
+
+        proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True)
+
+        assert json.loads(proc.stdout) == {
+            "arbitraryRoleTextbox": False,
+            "ariaDisabledAncestor": False,
+            "inertAncestor": False,
+            "disabledFieldsetAncestor": False,
+            "input": True,
+            "textarea": True,
+            "contenteditable": True,
+        }
+
+    def test_orphan_reaper_only_touches_versioned_dead_owned_daemons(self, tmp_path, monkeypatch):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir(mode=0o700)
+        runtime.chmod(0o700)
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+        monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+        monkeypatch.setattr(bu_cli, "_OWNED_DAEMONS", {})
+        live_name = "ha1-dead-owner"
+        (runtime / f"{live_name}.owner.json").write_text(
+            json.dumps({"version": 1, "session": live_name, "task_id": "old", "owner_pid": 424242})
+        )
+        (runtime / f"{live_name}.owner.json").chmod(0o600)
+        (runtime / "legacy.owner.json").write_text(
+            json.dumps({"version": 1, "session": "legacy", "owner_pid": 424242})
+        )
+        calls = []
+        monkeypatch.setattr(bu_cli, "_pid_is_alive", lambda pid: False)
+
+        def control(session, action, *, timeout_s=None):
+            calls.append((session, action))
+            return True
+
+        monkeypatch.setattr(bu_cli, "_private_daemon_control", control)
+        assert bu_cli.reap_owned_browser_use_orphans(limit=8) == 1
+        assert calls == [(live_name, "ping"), (live_name, "shutdown")]
+        assert not (runtime / f"{live_name}.owner.json").exists()
+        assert (runtime / "legacy.owner.json").exists()
 
 
 class TestProviderPickerIntegration:
@@ -795,6 +1258,12 @@ class TestStepLabels:
 
 
 class TestHeaderVariants:
+    def test_schema_requires_navigation_and_actions_in_separate_calls(self):
+        description = bu_cli._HEADER_BASE + bu_cli._HELPERS_DIGEST
+
+        assert "Navigation/target changes and actions must use separate calls" in description
+        assert "Batch each sub-procedure (navigate, wait, extract, act) into one call" not in description
+
     def test_vision_header_forbids_vision_tool_detour(self, monkeypatch):
         monkeypatch.setattr(
             "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
@@ -835,6 +1304,12 @@ class TestSkillTextDescription:
                        "click_at_xy(", "capture_screenshot()", "cdp("):
             assert helper in bu_cli._HELPERS_DIGEST
 
+    def test_digest_routes_auth_walls_to_native_component_request(self):
+        assert "<semreh.native-component>" in bu_cli._HELPERS_DIGEST
+        assert "website_login" not in bu_cli._HELPERS_DIGEST
+        assert "never" in bu_cli._HELPERS_DIGEST.lower()
+        assert "credential" in bu_cli._HELPERS_DIGEST.lower()
+
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
         assert bu_cli._HELPERS_DIGEST in desc
@@ -851,6 +1326,76 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec("   "))
         assert "error" in result
 
+    def test_new_tab_then_fill_is_rejected_before_cli_dispatch(self, monkeypatch):
+        monkeypatch.setattr(
+            bu_cli,
+            "_find_cli",
+            lambda: (_ for _ in ()).throw(AssertionError("browser-use CLI must not run")),
+        )
+
+        result = json.loads(
+            bu_cli.browser_exec(
+                "new_tab('https://example.test/login')\n"
+                "fill_input('input[name=email]', 'person@example.test')"
+            )
+        )
+
+        assert "separate browser_exec calls" in result["error"]
+
+    def test_goto_then_click_aliases_are_rejected_before_cli_dispatch(self, monkeypatch):
+        monkeypatch.setattr(
+            bu_cli,
+            "_find_cli",
+            lambda: (_ for _ in ()).throw(AssertionError("browser-use CLI must not run")),
+        )
+
+        result = json.loads(
+            bu_cli.browser_exec(
+                "go = goto_url\n"
+                "click = click_at_xy\n"
+                "go('https://example.test/login')\n"
+                "click(20, 30)"
+            )
+        )
+
+        assert "separate browser_exec calls" in result["error"]
+
+    def test_raw_cdp_navigate_then_input_is_rejected_before_cli_dispatch(self, monkeypatch):
+        monkeypatch.setattr(
+            bu_cli,
+            "_find_cli",
+            lambda: (_ for _ in ()).throw(AssertionError("browser-use CLI must not run")),
+        )
+
+        result = json.loads(
+            bu_cli.browser_exec(
+                "cdp('Page.navigate', url='https://example.test/login')\n"
+                "cdp('Input.insertText', text='person@example.test')"
+            )
+        )
+
+        assert "separate browser_exec calls" in result["error"]
+
+    def test_terminal_navigation_still_runs_pre_and_post_probes(self, tmp_path, monkeypatch):
+        probes = []
+        cli = _fake_cli(tmp_path, "cat > /dev/null\necho navigated\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(
+            bu_cli,
+            "_run_privileged_native_auth_probe",
+            lambda **kwargs: probes.append(kwargs) or (True, None, {"success": True}),
+        )
+
+        result = json.loads(
+            bu_cli.browser_exec(
+                "new_tab('https://example.test/login')",
+                task_id="phase-probe-task",
+            )
+        )
+
+        assert result["success"] is True
+        assert len(probes) == 2
+
     def test_code_piped_on_stdin(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'code=$(cat)\necho "got:$code"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
@@ -861,10 +1406,12 @@ class TestBrowserExec:
         assert "session" not in result
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bu_cli, "_PROCESS_GENERATION", "exec-test-generation")
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2"))
-        assert "bu:r7k2" in result["output"]
+        effective = bu_cli._effective_session_name("r7k2", None)
+        assert f"bu:{effective}" in result["output"]
         assert result["session"] == "r7k2"
 
     def test_invalid_session_name_rejected(self, monkeypatch, tmp_path):
@@ -1092,3 +1639,1028 @@ class TestDefaultDowngradeNotice:
         )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.default_downgrade_notice() is None
+def test_model_browser_exec_is_blocked_during_pending_native_auth(monkeypatch):
+    from tools.native_auth_runtime import native_auth_runtime
+
+    native_auth_runtime.create_context(
+        task_id="guard-task-1",
+        browser_session_key="guard-browser-1",
+        browser_session_id="guard-browser-1",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_guard_password_12345678"},
+        }],
+        actions=[{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "css", "value": "button[type=submit]", "target_id": "ref_guard_submit_12345678"},
+        }],
+        browser_backend="browser-use",
+    )
+    result = json.loads(bu_cli.browser_exec(
+        'fill_input("input[type=password]", "should-not-run")',
+        task_id="guard-task-1",
+    ))
+    assert "auth_boundary_required" in result["error"]
+
+
+def test_builtin_browser_type_is_blocked_for_reserved_auth_ref(monkeypatch):
+    import tools.browser_tool as browser_tool
+    from tools.native_auth_runtime import native_auth_runtime
+
+    native_auth_runtime.create_context(
+        task_id="guard-task-2",
+        browser_session_key="guard-browser-2",
+        browser_session_id="guard-browser-2",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "ref", "value": "@e1"},
+        }],
+        actions=[{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "ref", "value": "@e2"},
+        }],
+        browser_backend="fake",
+    )
+    monkeypatch.setattr(browser_tool, "_blocked_private_page_action", lambda *args: None)
+    monkeypatch.setattr(browser_tool, "_run_browser_command", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("browser command must not run")))
+    result = json.loads(browser_tool.browser_type("@e1", "should-not-run", task_id="guard-task-2"))
+    assert result["success"] is False
+    assert result["auth_boundary_required"] is True
+
+
+def test_validate_native_target_accepts_bounded_locator_strategies_and_rejects_code():
+    from tools.browser_use_cli import validate_native_target
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    for target in (
+        {"strategy": "css", "value": "form input[type=password]"},
+        {"strategy": "xpath", "value": "//input[@autocomplete='current-password']"},
+        {"strategy": "role", "value": "textbox:Password"},
+        {"strategy": "label", "value": "Password"},
+    ):
+        validate_native_target(target)
+
+    with pytest.raises(NativeAuthSecurityError):
+        validate_native_target({"strategy": "css", "value": "javascript:alert(1)"})
+    with pytest.raises(NativeAuthSecurityError):
+        validate_native_target({"strategy": "css", "value": "<script>evil</script>"})
+
+
+def test_default_browser_use_fill_uses_private_session_binding(monkeypatch):
+    from tools.native_auth_runtime import NativeAuthRuntime
+    import tools.browser_use_cli as browser_use_cli
+
+    runtime = NativeAuthRuntime()
+    public = runtime.create_context(
+        task_id="session-123",
+        browser_session_key="browser-key-123",
+        browser_session_id="browser-session-123",
+        provider_origin="https://accounts.example.test",
+        path="/login",
+        flow="password",
+        fields=[{
+            "field_id": "password",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_fill_password_12345678"},
+        }],
+        actions=[],
+        browser_backend="browser-use",
+        browser_session_name="named-auth-session",
+    )
+    internal = runtime._contexts[public["context_id"]]
+    field = internal.public["fields"][0]
+    captured = {}
+
+    def fake_fill(**kwargs):
+        captured.update(kwargs)
+        return {"state": "filled"}
+
+    monkeypatch.setattr(browser_use_cli, "secure_native_fill", fake_fill)
+    result = runtime._default_fill_executor(
+        context=internal.public,
+        field=field,
+        plaintext="synthetic-value",
+    )
+
+    assert result["state"] == "filled"
+    assert captured["session"] == "named-auth-session"
+    assert captured["expected_origin"] == "https://accounts.example.test"
+    assert captured["expected_path"] == "/login"
+    assert captured["plaintext"] == "synthetic-value"
+
+
+def test_secure_native_preflight_revalidates_form_method_action_and_identity():
+    target = {
+        "strategy": "css",
+        "value": "#password",
+        "target_id": "ref_f_field12345678__form_login12345678",
+    }
+    expression = bu_cli._secure_target_preflight_script(
+        target,
+        expected_origin="https://accounts.example.test",
+        expected_path="/login",
+    )
+
+    assert "HTMLFormElement" in expression
+    assert "__hermesNativeAuthFormRefs" in expression
+    assert "form_login12345678" in expression
+    assert "form.method" in expression
+    assert "form.action" in expression
+    assert "record.method !== 'post'" in expression
+    assert "action.protocol !== 'https:'" in expression
+
+
+def test_secure_native_preflight_returns_only_opaque_ack(monkeypatch):
+    import tools.browser_use_cli as browser_use_cli
+
+    captured = {}
+
+    def fake_cdp(session, method, params, *, timeout_s=None):
+        captured.update(session=session, method=method, params=params)
+        return {"result": {"type": "boolean", "value": True}}
+
+    monkeypatch.setattr(browser_use_cli, "_private_cdp_request", fake_cdp)
+    result = browser_use_cli.secure_native_preflight(
+        session="named-auth-session",
+        target={"strategy": "css", "value": "input[type=password]", "target_id": "ref_12345678"},
+        expected_origin="https://accounts.example.test",
+        expected_path="/login",
+        expected_tab_handle="tab_12345678",
+        expected_frame_handle="frame_12345678",
+        expected_document_generation="doc_12345678",
+    )
+
+    assert result == {"state": "validated"}
+    assert captured["session"] == "named-auth-session"
+    assert captured["method"] == "Runtime.evaluate"
+    expression = captured["params"]["expression"]
+    assert "accounts.example.test" in expression
+    assert "/login" in expression
+    assert "input[type=password]" in expression
+    assert "ref_12345678" in expression
+    assert "tab_12345678" in expression
+    assert "frame_12345678" in expression
+    assert "doc_12345678" in expression
+    assert captured["params"]["returnByValue"] is True
+    assert "synthetic-value" not in repr(captured)
+
+
+def test_secure_native_preflight_fails_closed_without_ack(monkeypatch):
+    import tools.browser_use_cli as browser_use_cli
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    monkeypatch.setattr(
+        browser_use_cli,
+        "_private_cdp_request",
+        lambda *_args, **_kwargs: {"result": {"type": "boolean", "value": False}},
+    )
+    with pytest.raises(NativeAuthSecurityError, match="preflight"):
+        browser_use_cli.secure_native_preflight(
+            session="named-auth-session",
+            target={"strategy": "css", "value": "input[type=password]"},
+            expected_origin="https://accounts.example.test",
+            expected_path="/login",
+        )
+
+
+def test_secure_target_binding_rejects_same_selector_replacement():
+    """A replacement node must not inherit the browser-minted target ID."""
+    target = {
+        "strategy": "css",
+        "value": "input[type=password]",
+        "target_id": "ref_exact_node_12345678",
+    }
+    expression = bu_cli._secure_target_preflight_script(
+        target,
+        expected_origin="https://accounts.example.test",
+        expected_path="/login",
+    )
+    harness = f"""
+class Element {{
+  constructor() {{ this.disabled = false; this.readOnly = false; }}
+  getBoundingClientRect() {{ return {{width: 10, height: 10}}; }}
+  getAttribute() {{ return null; }}
+  hasAttribute() {{ return false; }}
+}}
+const original = new Element();
+const replacement = new Element();
+global.Element = Element;
+global.location = {{origin: 'https://accounts.example.test', pathname: '/login'}};
+global.getComputedStyle = () => ({{display: 'block', visibility: 'visible'}});
+global.document = {{querySelectorAll: () => [replacement]}};
+global.window = {{__hermesNativeAuthTargetRefs: {{'input[type=password]': 'ref_exact_node_12345678'}}}};
+process.stdout.write(String({expression}));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True)
+
+    assert proc.stdout == "false"
+    assert "WeakMap" in bu_cli._NATIVE_AUTH_PROBE_PREAMBLE
+    assert ".get(element)" in expression
+
+
+def test_secure_native_fill_uses_only_final_cdp_argument_for_plaintext(monkeypatch):
+    """Plaintext crosses the process boundary only as callFunctionOn data."""
+    secret = "synthetic-secret-direct-cdp-canary"
+    calls = []
+
+    def fake_cdp(session, method, params, *, timeout_s=None):
+        calls.append((session, method, params))
+        if method == "Runtime.evaluate" and params.get("returnByValue") is True:
+            return {"result": {"type": "boolean", "value": True}}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "object", "objectId": "remote-object-1"}}
+        if method == "Runtime.callFunctionOn":
+            assert params["arguments"] == [{"value": secret}]
+            assert secret not in params["functionDeclaration"]
+            return {"result": {"type": "boolean", "value": True}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(
+        bu_cli,
+        "browser_exec",
+        lambda **_: (_ for _ in ()).throw(AssertionError("browser_exec forbidden")),
+    )
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_cdp)
+
+    result = bu_cli.secure_native_fill(
+        session="auth-test",
+        target={"strategy": "css", "value": "form input[type=password]"},
+        plaintext=secret,
+        expected_origin="https://accounts.example.test",
+        expected_path="/login",
+    )
+
+    assert result == {"state": "filled"}
+    assert [method for _, method, _ in calls] == [
+        "Runtime.evaluate",
+        "Runtime.evaluate",
+        "Runtime.callFunctionOn",
+        "Runtime.releaseObject",
+    ]
+    for _, method, params in calls:
+        if method != "Runtime.callFunctionOn":
+            assert secret not in repr(params)
+    assert secret not in json.dumps(result)
+
+
+def test_native_fill_function_rejects_detached_or_replaced_element():
+    """The final CDP call must close the resolve-to-fill TOCTOU window."""
+    if not shutil.which("node"):
+        pytest.skip("node is required for the browser-side fill guard probe")
+
+    function_declaration = json.dumps(bu_cli._NATIVE_FILL_FUNCTION)
+    harness = f"""
+global.document = {{}};
+class HTMLInputElement {{
+  constructor() {{
+    this.isConnected = false;
+    this.ownerDocument = global.document;
+    this.disabled = false;
+    this.readOnly = false;
+  }}
+  focus() {{ throw new Error('detached target must not be focused'); }}
+  blur() {{}}
+  dispatchEvent() {{}}
+  hasAttribute() {{ return false; }}
+  getAttribute() {{ return null; }}
+}}
+class HTMLTextAreaElement extends HTMLInputElement {{}}
+global.HTMLInputElement = HTMLInputElement;
+global.HTMLTextAreaElement = HTMLTextAreaElement;
+global.Event = class Event {{ constructor() {{}} }};
+const fn = eval('(' + {function_declaration} + ')');
+let result;
+try {{
+  result = String(fn.call(new HTMLInputElement(), 'synthetic'));
+}} catch (_error) {{
+  result = 'threw';
+}}
+process.stdout.write(result);
+"""
+
+    proc = subprocess.run(["node", "-e", harness], capture_output=True, text=True, check=True)
+
+    assert proc.stdout == "false"
+
+
+def test_private_cdp_ipc_sends_one_json_line_and_returns_only_result(tmp_path, monkeypatch):
+    runtime, _endpoint, captured, thread = _start_private_ipc_server(
+        tmp_path,
+        "auth-ipc",
+        b'{"result":{"result":{"type":"boolean","value":true}}}',
+    )
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    result = bu_cli._private_harness_request(
+        "auth-ipc",
+        {
+            "method": "Runtime.evaluate",
+            "params": {"expression": "true", "returnByValue": True},
+        },
+    )
+    thread.join(timeout=2)
+
+    assert result == {"result": {"result": {"type": "boolean", "value": True}}}
+    assert len(captured) == 1
+    assert captured[0].endswith(b"\n")
+    assert captured[0].count(b"\n") == 1
+    assert json.loads(captured[0]) == {
+        "method": "Runtime.evaluate",
+        "params": {"expression": "true", "returnByValue": True},
+    }
+
+
+def test_private_cdp_matches_harness_019_permissions_wire_and_pid(tmp_path, monkeypatch):
+    def handler(request):
+        if request == {"meta": "ping"}:
+            return {"pong": True, "pid": os.getpid(), "browser_kind": "cdp"}
+        return {"result": {"result": {"type": "boolean", "value": True}}}
+
+    runtime, endpoint, captured, thread = _start_harness_019_server(
+        tmp_path,
+        "auth-019",
+        handler,
+        socket_mode=0o700,
+    )
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+    assert stat.S_IMODE(endpoint.lstat().st_mode) == 0o700
+
+    result = bu_cli._private_cdp_request(
+        "auth-019",
+        "Runtime.evaluate",
+        {"expression": "true", "returnByValue": True},
+    )
+    thread.join(timeout=2)
+
+    assert result == {"result": {"type": "boolean", "value": True}}
+    assert captured == [
+        {"meta": "ping"},
+        {
+            "method": "Runtime.evaluate",
+            "params": {"expression": "true", "returnByValue": True},
+        },
+    ]
+
+
+def test_private_cdp_rejects_socket_owned_by_pid_other_than_pid_file(tmp_path, monkeypatch):
+    recorded_pid = os.getpid()
+
+    def handler(request):
+        if request == {"meta": "ping"}:
+            return {"pong": True, "pid": recorded_pid + 100000}
+        return {"result": {"result": {"type": "boolean", "value": True}}}
+
+    runtime, _endpoint, captured, thread = _start_harness_019_server(
+        tmp_path,
+        "auth-stale",
+        handler,
+        pid=recorded_pid,
+    )
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    with pytest.raises(NativeAuthSecurityError, match="channel unavailable"):
+        bu_cli._private_cdp_request(
+            "auth-stale",
+            "Runtime.evaluate",
+            {"expression": "true", "returnByValue": True},
+        )
+    thread.join(timeout=2)
+
+    assert captured == [{"meta": "ping"}]
+
+
+def test_private_cdp_sends_no_plaintext_if_endpoint_rebinds_before_send(tmp_path, monkeypatch):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    secret = "synthetic-rebind-secret-canary"
+    expected = (os.getpid(), (1, 100))
+    rebound = (os.getpid(), (1, 101))
+    identities = iter([expected, rebound])
+    sent = []
+
+    class FakeClient:
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _endpoint):
+            pass
+
+        def sendall(self, data):
+            sent.append(data)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(bu_cli, "_private_daemon_identity", lambda *_a, **_k: expected)
+    monkeypatch.setattr(
+        bu_cli,
+        "_harness_runtime_layout",
+        lambda _session: (tmp_path, "bu-auth-race"),
+    )
+    monkeypatch.setattr(
+        bu_cli,
+        "_private_harness_identity",
+        lambda _runtime, _stem: next(identities),
+    )
+    monkeypatch.setattr(bu_cli.socket, "socket", lambda *_a, **_k: FakeClient())
+
+    with pytest.raises(NativeAuthSecurityError) as exc_info:
+        bu_cli._private_cdp_request(
+            "auth-race",
+            "Runtime.callFunctionOn",
+            {"arguments": [{"value": secret}]},
+        )
+
+    assert sent == []
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize("bad_mode", [0o755, 0o777])
+def test_private_cdp_ipc_rejects_nonprivate_runtime_mode(tmp_path, monkeypatch, bad_mode):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    runtime.chmod(bad_mode)
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    with pytest.raises(NativeAuthSecurityError, match="channel unavailable"):
+        bu_cli._private_cdp_request("auth-mode", "Runtime.evaluate", {"expression": "true"})
+
+
+def test_private_cdp_ipc_rejects_nonprivate_socket_mode(tmp_path, monkeypatch):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    runtime, endpoint, _captured, _thread = _start_private_ipc_server(
+        tmp_path,
+        "auth-mode",
+        b'{"result":{}}',
+    )
+    endpoint.chmod(0o666)
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    with pytest.raises(NativeAuthSecurityError, match="channel unavailable"):
+        bu_cli._private_cdp_request("auth-mode", "Runtime.evaluate", {"expression": "true"})
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b"not-json",
+        b'{"error":"daemon raw secret synthetic-daemon-canary"}',
+        b'{"result":[]}',
+    ],
+)
+def test_private_cdp_ipc_sanitizes_malformed_and_daemon_errors(
+    tmp_path, monkeypatch, caplog, response
+):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    runtime, _endpoint, _captured, thread = _start_private_ipc_server(
+        tmp_path, "auth-error", response
+    )
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    with pytest.raises(NativeAuthSecurityError) as exc_info:
+        bu_cli._private_cdp_request("auth-error", "Runtime.evaluate", {"expression": "true"})
+    thread.join(timeout=2)
+    assert str(exc_info.value) == "secure browser channel unavailable"
+    assert "synthetic-daemon-canary" not in repr(exc_info.value)
+    assert "synthetic-daemon-canary" not in caplog.text
+
+
+def test_private_cdp_ipc_timeout_is_sanitized(tmp_path, monkeypatch):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    runtime, _endpoint, _captured, thread = _start_private_ipc_server(
+        tmp_path,
+        "auth-timeout",
+        b'{"result":{}}',
+        delay=0.3,
+    )
+    monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("BH_RUNTIME_DIR_SHARED", "1")
+
+    with pytest.raises(NativeAuthSecurityError) as exc_info:
+        bu_cli._private_cdp_request(
+            "auth-timeout", "Runtime.evaluate", {"expression": "true"}, timeout_s=0.1
+        )
+    thread.join(timeout=2)
+    assert str(exc_info.value) == "secure browser channel unavailable"
+
+
+def test_secure_native_fill_rejects_target_change_after_preflight(monkeypatch):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    calls = []
+
+    def fake_cdp(_session, method, params, *, timeout_s=None):
+        calls.append((method, params))
+        if len(calls) == 1:
+            return {"result": {"type": "boolean", "value": True}}
+        return {"result": {"type": "boolean", "value": False}}
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_cdp)
+    with pytest.raises(NativeAuthSecurityError, match="target changed"):
+        bu_cli.secure_native_fill(
+            session="auth-test",
+            target={"strategy": "css", "value": "input[type=password]"},
+            plaintext="synthetic-never-transferred",
+            expected_origin="https://accounts.example.test",
+            expected_path="/login",
+        )
+    assert [method for method, _ in calls] == ["Runtime.evaluate", "Runtime.evaluate"]
+    assert "synthetic-never-transferred" not in repr(calls)
+
+
+def test_secure_native_fill_releases_remote_object_on_fill_failure(monkeypatch):
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    secret = "synthetic-failing-fill-canary"
+    calls = []
+
+    def fake_cdp(_session, method, params, *, timeout_s=None):
+        calls.append((method, params))
+        if len(calls) == 1:
+            return {"result": {"type": "boolean", "value": True}}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "object", "objectId": "remote-failure"}}
+        if method == "Runtime.callFunctionOn":
+            raise NativeAuthSecurityError("secure browser channel unavailable")
+        return {}
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_cdp)
+    with pytest.raises(NativeAuthSecurityError) as exc_info:
+        bu_cli.secure_native_fill(
+            session="auth-test",
+            target={"strategy": "css", "value": "input[type=password]"},
+            plaintext=secret,
+            expected_origin="https://accounts.example.test",
+            expected_path="/login",
+        )
+
+    assert calls[-1] == ("Runtime.releaseObject", {"objectId": "remote-failure"})
+    assert secret not in str(exc_info.value)
+    assert secret not in repr(exc_info.value)
+
+
+def test_extract_native_auth_probe_output_strips_marker_and_returns_metadata():
+    payload = {
+        "origin": "https://example.com",
+        "path": "/login",
+        "title": "Sign in",
+        "fields": [
+            {
+                "field_id": "field_1",
+                "kind": "password",
+                "label": "Password",
+                "required": True,
+                "target": {"strategy": "css", "value": "form input[type=password]"},
+            }
+        ],
+        "actions": [],
+    }
+    output = "ordinary output\n" + bu_cli._NATIVE_AUTH_CONTEXT_PREFIX + json.dumps(payload) + "\n"
+    clean, extracted = bu_cli._extract_native_auth_probe_output(output)
+    assert clean == "ordinary output"
+    assert extracted == payload
+
+
+def test_browser_exec_returns_wire_auth_context_from_browser_probe(tmp_path, monkeypatch):
+    probe_payload = {
+        "origin": "https://accounts.example.test",
+        "path": "/login",
+        "title": "Sign in",
+        "document_generation": "doc_12345678",
+        "tab_handle": "tab_12345678",
+        "frame_handle": "frame_12345678",
+        "form": {
+            "form_id": "form_login_12345678",
+            "method": "post",
+            "action": "https://accounts.example.test/session",
+        },
+        "fields": [{
+            "field_id": "field_1",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {"strategy": "css", "value": "input[type=password]", "target_id": "ref_f_password_12345678__form_login_12345678"},
+        }],
+        "actions": [{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {"strategy": "css", "value": "button[type=submit]", "target_id": "ref_a_submit_12345678__form_login_12345678"},
+        }],
+        "signals": "Sign in password",
+    }
+    body = (
+        "printf '%s%s\n' 'HERMES_NATIVE_AUTH_PROBE_STATUS:ok' ''; "
+        "printf '%s%s\n' 'HERMES_NATIVE_AUTH_CONTEXT:' "
+        + shlex.quote(json.dumps(probe_payload, separators=(",", ":")))
+        + "\n"
+    )
+    cli = _fake_cli(tmp_path, body)
+    monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+    monkeypatch.setattr(bu_cli, "_base_subprocess_env", lambda: {"PATH": os.environ.get("PATH", "")})
+    monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id, session_name=None: None)
+    monkeypatch.setattr(bu_cli, "_workspace_dir", lambda task_id: None)
+    monkeypatch.setattr(bu_cli, "is_legacy_browser_use_cloud_config", lambda _: False)
+
+    result = json.loads(bu_cli.browser_exec(
+        "print('browser work')",
+        session="auth-probe-test",
+        task_id="auth-probe-task",
+    ))
+    assert result["success"] is True, result
+    auth_context = result["auth_context"]
+    assert auth_context["type"] == "hermes.auth-context.v1"
+    assert auth_context["provider_origin"] == "https://accounts.example.test"
+    assert auth_context["component_ids"]
+    from tools.native_auth_runtime import native_auth_runtime
+    internal = native_auth_runtime._contexts[auth_context["context_id"]]
+    assert internal.public["document_generation"] == "doc_12345678"
+    assert internal.public["tab_handle"] == "tab_12345678"
+    assert internal.public["frame_handle"] == "frame_12345678"
+    assert internal.public["fields"][0]["target"]["target_id"] == "ref_f_password_12345678__form_login_12345678"
+    assert "input[type=password]" not in json.dumps(auth_context)
+
+
+def test_native_auth_probe_rejects_cross_form_descriptor_aggregation_before_context_minting():
+    payload = {
+        "origin": "https://accounts.example.test",
+        "path": "/login",
+        "title": "Sign in",
+        "document_generation": "doc_cross_form_12345678",
+        "tab_handle": "tab_cross_form_12345678",
+        "frame_handle": "frame_cross_form_12345678",
+        "form": {
+            "form_id": "form_primary_12345678",
+            "method": "post",
+            "action": "https://accounts.example.test/session",
+        },
+        "fields": [{
+            "field_id": "field_1",
+            "kind": "password",
+            "label": "Password",
+            "required": True,
+            "target": {
+                "strategy": "css",
+                "value": "#form-a-password",
+                "target_id": "ref_f_field12345678__form_primary_12345678",
+            },
+        }],
+        "actions": [{
+            "action_id": "submit",
+            "kind": "submit",
+            "label": "Sign in",
+            "target": {
+                "strategy": "css",
+                "value": "#form-b-submit",
+                "target_id": "ref_a_action12345678__form_other_12345678",
+            },
+        }],
+        "signals": "Sign in password",
+    }
+
+    assert bu_cli._native_auth_context_from_probe(
+        payload,
+        task_id="cross-form-probe-task",
+        session="cross-form-probe-session",
+    ) is None
+
+
+def test_native_auth_probe_rejects_url_leaking_get_submission_before_context_minting():
+    canary = "synthetic-get-url-canary"
+    payload = {
+        "form": {
+            "form_id": "form_get_12345678",
+            "method": "get",
+            "action": f"https://accounts.example.test/login?password={canary}",
+        },
+        "fields": [{
+            "target": {
+                "target_id": "ref_f_password_12345678__form_get_12345678",
+            },
+        }],
+        "actions": [{
+            "kind": "submit",
+            "target": {
+                "target_id": "ref_a_submit_12345678__form_get_12345678",
+            },
+        }],
+    }
+
+    assert bu_cli._is_form_bound_probe_payload(payload) is False
+
+
+def test_native_auth_probe_discovers_exactly_one_safe_form_instead_of_aggregating_document_controls():
+    probe = bu_cli._NATIVE_AUTH_PROBE_PREAMBLE
+
+    assert "Array.from(document.forms)" in probe
+    assert "viableForms.length !== 1" in probe
+    assert "element.form === form" in probe
+    assert "rawMethod !== \"post\"" in probe
+    assert "effectiveMethod !== \"post\"" in probe
+    assert "effectiveAction.protocol !== \"https:\"" in probe
+    assert "submitCandidates.length !== 1" in probe
+    assert "form: formRecord" in probe
+
+
+def test_native_auth_probe_emits_a_bounded_submit_action_for_explicit_submit_controls():
+    probe = bu_cli._NATIVE_AUTH_PROBE_PREAMBLE
+
+    assert "const submitCandidates" in probe
+    assert "Array.from(form.elements)" in probe
+    assert '(element.type || \"\").toLowerCase() === \"submit\"' in probe
+    assert 'kind: "submit"' in probe
+
+
+def test_native_auth_probe_uses_associated_labels_and_humanizes_names():
+    probe = bu_cli._NATIVE_AUTH_PROBE_PREAMBLE
+
+    assert 'querySelectorAll("label")' in probe
+    assert 'getAttribute("for")' in probe
+    assert 'replace(/[_-]+/g, " ")' in probe
+
+
+def test_native_auth_probe_emits_working_whitespace_and_control_regexes():
+    probe = bu_cli._NATIVE_AUTH_PROBE_PREAMBLE
+
+    assert '.replace(/\\s+/g, " ")' in probe
+    assert '.replace(/[\\u0000-\\u001f\\u007f]/g, " ")' in probe
+
+
+def test_resolve_native_auth_v2_inventories_current_react_page_without_form(monkeypatch):
+    calls = []
+
+    element_objects = {"element-account": 101, "element-submit": 102}
+
+    def fake_private_cdp(session, method, params, **kwargs):
+        calls.append((session, method, params))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {
+                "targetId": "target-current",
+                "type": "page",
+                "url": "https://accounts.example.test/signin?from=mail#fragment",
+            }}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {
+                "id": "frame-current",
+                "loaderId": "loader-current",
+                "url": "https://accounts.example.test/signin?from=mail#fragment",
+            }}}
+        if method == "Runtime.evaluate":
+            assert params["returnByValue"] is False
+            return {"result": {"type": "object", "objectId": "array-object"}}
+        if method == "Runtime.getProperties":
+            assert params == {"objectId": "array-object", "ownProperties": True}
+            return {"result": [
+                {"name": "0", "value": {"type": "object", "objectId": "element-account"}},
+                {"name": "1", "value": {"type": "object", "objectId": "element-submit"}},
+            ]}
+        if method == "Runtime.callFunctionOn":
+            assert params["returnByValue"] is True
+            descriptor = {
+                "element-account": {
+                    "eligible": True,
+                    "role": "textbox",
+                    "label": "Account",
+                    "hints": {"masked": False, "required": True, "keyboard": "text"},
+                },
+                "element-submit": {"eligible": True, "role": "button", "label": "Continue", "hints": {}},
+            }[params["objectId"]]
+            return {"result": {"type": "object", "value": descriptor}}
+        if method == "DOM.describeNode":
+            return {"node": {"backendNodeId": element_objects[params["objectId"]]}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_private_cdp)
+    monkeypatch.setattr(bu_cli, "_verify_native_auth_owner", lambda **_: True, raising=False)
+
+    result = bu_cli.resolve_native_auth_v2(browser_session="named-login", task_id="task-1")
+
+    assert result["origin"] == "https://accounts.example.test"
+    assert result["path"] == "/signin"
+    assert [target["ref"] for target in result["targets"]] == ["@e1", "@e2"]
+    assert all(set(target) == {"ref", "role", "label", "hints", "target"} for target in result["targets"])
+    assert result["targets"][0]["hints"] == {
+        "masked": False, "required": True, "keyboard": "text",
+    }
+    assert result["targets"][1]["hints"] == {}
+    assert result["targets"][0]["target"] == {
+        "target_id": "target-current", "frame_id": "frame-current",
+        "loader_id": "loader-current", "backend_node_id": 101,
+    }
+    assert result["targets"][1]["target"] == {
+        "target_id": "target-current", "frame_id": "frame-current",
+        "loader_id": "loader-current", "backend_node_id": 102,
+    }
+    assert [params["objectId"] for _, method, params in calls if method == "Runtime.releaseObject"] == [
+        "element-account", "element-submit", "array-object",
+    ]
+    assert not any("selector" in json.dumps(params) or "target:" in json.dumps(params)
+                   for _, _, params in calls)
+
+
+def test_resolve_native_auth_v2_binds_current_target_not_same_url_tab(monkeypatch):
+    calls = []
+
+    def fake_private_cdp(session, method, params, **kwargs):
+        calls.append((method, params))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "current-target", "type": "page",
+                                    "url": "https://same.test/signin?tab=old#fragment"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "current-frame", "loaderId": "current-loader", "url": "https://same.test/signin"}}}
+        if method == "Runtime.evaluate":
+            assert params["returnByValue"] is False
+            return {"result": {"type": "object", "objectId": "array-object"}}
+        if method == "Runtime.getProperties":
+            return {"result": [
+                {"name": "0", "value": {"type": "object", "objectId": "current-element"}},
+            ]}
+        if method == "Runtime.callFunctionOn":
+            assert params["objectId"] == "current-element"
+            assert params["returnByValue"] is True
+            return {"result": {"type": "object", "value": {
+                "eligible": True,
+                "role": "textbox",
+                "label": "Account",
+                "hints": {"masked": False, "required": True, "keyboard": "text"},
+            }}}
+        if method == "DOM.describeNode":
+            assert params["objectId"] == "current-element"
+            return {"node": {"backendNodeId": 404}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_private_cdp)
+    monkeypatch.setattr(bu_cli, "_verify_native_auth_owner", lambda **_: True, raising=False)
+
+    result = bu_cli.resolve_native_auth_v2(browser_session="named-login", task_id="task-1")
+
+    assert result["targets"]
+    assert result["targets"] == [{
+        "ref": "@e1",
+        "role": "textbox",
+        "label": "Account",
+        "hints": {"masked": False, "required": True, "keyboard": "text"},
+        "target": {
+            "target_id": "current-target",
+            "frame_id": "current-frame",
+            "loader_id": "current-loader",
+            "backend_node_id": 404,
+        },
+    }]
+
+    methods = [method for method, _ in calls]
+    assert "Target.getTargetInfo" in methods
+    assert not any(method == "Target.getTargets" for method in methods)
+    evaluate_code = [params["expression"] for method, params in calls if method == "Runtime.evaluate"]
+    assert evaluate_code
+    assert all("current-target" not in code for code in evaluate_code)
+    assert not any(method == "Target.getTargets" for method, _ in calls)
+    assert any(
+        method == "DOM.describeNode" and params["objectId"] == "current-element"
+        for method, params in calls
+    )
+
+
+@pytest.mark.parametrize("bad_target", [
+    {"eligible": False, "role": "textbox", "label": "Hidden", "hints": {}},
+    {"eligible": False, "role": "textbox", "label": "Disabled", "hints": {}},
+    {"eligible": True, "role": "textbox", "label": "Duplicate", "hints": {}},
+    {"eligible": False, "role": "textbox", "label": "Detached", "hints": {}},
+])
+def test_resolve_native_auth_v2_omits_unsafe_candidates_and_leaks_no_page_data(monkeypatch, bad_target):
+    calls = []
+
+    def fake_private_cdp(session, method, params, **kwargs):
+        calls.append((method, params))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "target-safe", "type": "page",
+                                    "url": "https://safe.test/signin?secret=1#frag"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-safe", "loaderId": "loader-safe",
+                                               "url": "https://safe.test/signin?secret=1#frag"}}}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "object", "objectId": "array-object"}}
+        if method == "Runtime.getProperties":
+            return {"result": [
+                {"name": "0", "value": {"type": "object", "objectId": "unsafe-element"}},
+                {"name": "1", "value": {"type": "object", "objectId": "safe-element"}},
+            ]}
+        if method == "Runtime.callFunctionOn":
+            descriptor = bad_target if params["objectId"] == "unsafe-element" else {
+                "eligible": True, "role": "button", "label": "Continue", "hints": {},
+            }
+            return {"result": {"type": "object", "value": descriptor}}
+        if method == "DOM.describeNode":
+            backend_id = 78 if bad_target.get("label") == "Duplicate" else (
+                77 if params["objectId"] == "unsafe-element" else 78
+            )
+            return {"node": {"backendNodeId": backend_id}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_private_cdp)
+    monkeypatch.setattr(bu_cli, "_verify_native_auth_owner", lambda **_: True, raising=False)
+
+    result = bu_cli.resolve_native_auth_v2(browser_session="named-login", task_id="task-1")
+
+    assert result["path"] == "/signin"
+    assert [target["ref"] for target in result["targets"]] == ["@e2"]
+
+    assert any(method == "Runtime.releaseObject" for method, _ in calls)
+    request_code = "\n".join(
+        params.get(key, "") for method, params in calls
+        for key in ("expression", "functionDeclaration")
+        if method in {"Runtime.evaluate", "Runtime.callFunctionOn"}
+    )
+    for forbidden in (".value", "defaultValue", "innerHTML", "outerHTML",
+                      "document.cookie", "localStorage", "sessionStorage"):
+        assert forbidden not in request_code
+
+
+@pytest.mark.parametrize("malformed", [
+    {"origin": "https://safe.test", "path": "/signin", "targets": "not-a-list"},
+    {"origin": "https://safe.test", "path": "/signin", "targets": [{"ref": "@e1", "role": "textbox"}]},
+    {"origin": "https://safe.test", "path": "/signin", "targets": [{"ref": "@e1", "role": "textbox", "owner": "other-task"}]},
+])
+def test_resolve_native_auth_v2_fails_closed_on_malformed_or_wrong_owner_inventory(monkeypatch, malformed):
+    calls = []
+
+    def fake_private_cdp(session, method, params, **kwargs):
+        calls.append((method, params))
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "target-safe", "type": "page",
+                                    "url": "https://safe.test/signin"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "frame-safe", "loaderId": "loader-safe",
+                                               "url": "https://safe.test/signin"}}}
+        if method == "Runtime.evaluate":
+            return {"result": {"type": "object", "objectId": "array-object"}}
+        if method == "Runtime.getProperties":
+            if isinstance(malformed.get("targets"), list):
+                entries = [{"name": str(index), "value": {"type": "object", "objectId": f"element-{index}"}}
+                           for index, _ in enumerate(malformed["targets"])]
+            else:
+                entries = []
+            return {"result": entries}
+        if method == "Runtime.callFunctionOn":
+            index = int(params["objectId"].split("-")[-1])
+            descriptor = malformed["targets"][index] if isinstance(malformed.get("targets"), list) else {}
+            return {"result": {"type": "object", "value": descriptor}}
+        if method == "DOM.describeNode":
+            return {"node": {"backendNodeId": 100 + int(params["objectId"].split("-")[-1])}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(bu_cli, "_private_cdp_request", fake_private_cdp)
+    monkeypatch.setattr(bu_cli, "_verify_native_auth_owner", lambda **_: True, raising=False)
+    if isinstance(malformed.get("targets"), list) and any("owner" in item for item in malformed["targets"]):
+        monkeypatch.setattr(bu_cli, "_verify_native_auth_owner", lambda **_: False, raising=False)
+
+    from tools.native_auth_runtime import NativeAuthSecurityError
+
+    with pytest.raises(NativeAuthSecurityError, match="secure browser inspect unavailable"):
+        bu_cli.resolve_native_auth_v2(browser_session="named-login", task_id="task-1")
+    if any("owner" in item for item in malformed.get("targets", [])):
+        assert calls == []
+    else:
+        assert any(method == "Runtime.releaseObject" for method, _ in calls)
