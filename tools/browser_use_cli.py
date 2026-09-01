@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
+import psutil
+
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,25 @@ _OWNED_DAEMONS: dict[str, str] = {}
 _OWNED_DAEMONS_LOCK = threading.Lock()
 _ORPHAN_REAPED = False
 
+
+def _current_posix_uid() -> int | None:
+    """Return the current POSIX uid, or None when it cannot be established."""
+    if os.name != "posix":
+        return None
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return None
+    try:
+        return int(getuid())
+    except Exception:
+        return None
+
+
+def _is_current_posix_owner(owner_uid: int) -> bool:
+    """Require a known current POSIX uid before accepting file ownership."""
+    current_uid = _current_posix_uid()
+    return current_uid is not None and owner_uid == current_uid
+
 _NATIVE_FILL_FUNCTION = """function(value) {
   if (!this || !this.isConnected || this.ownerDocument !== document) return false;
   if (!(this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement)) return false;
@@ -138,7 +159,7 @@ def _harness_runtime_layout(session: str) -> tuple[Path, str]:
         if os.name != "nt":
             if (
                 not stat.S_ISDIR(runtime_stat.st_mode)
-                or runtime_stat.st_uid != os.getuid()
+                or not _is_current_posix_owner(runtime_stat.st_uid)
                 or stat.S_IMODE(runtime_stat.st_mode) != 0o700
             ):
                 raise PermissionError
@@ -154,7 +175,7 @@ def _private_harness_identity(runtime: Path, stem: str) -> tuple[int, tuple[Any,
     pid_path = runtime / f"{stem}.pid"
     pid_stat = pid_path.lstat()
     if not stat.S_ISREG(pid_stat.st_mode) or (
-        os.name != "nt" and pid_stat.st_uid != os.getuid()
+        os.name != "nt" and not _is_current_posix_owner(pid_stat.st_uid)
     ):
         raise PermissionError
     pid_text = pid_path.read_text(encoding="ascii").strip()
@@ -172,7 +193,7 @@ def _private_harness_identity(runtime: Path, stem: str) -> tuple[int, tuple[Any,
         # listener as 0700. Both are owner-only. Never accept group/world bits.
         if (
             not stat.S_ISSOCK(endpoint_stat.st_mode)
-            or endpoint_stat.st_uid != os.getuid()
+            or not _is_current_posix_owner(endpoint_stat.st_uid)
             or mode & 0o077
             or mode & 0o600 != 0o600
         ):
@@ -334,7 +355,7 @@ def _verify_native_auth_owner(browser_session: str, task_id: str) -> bool:
             if not stat.S_ISREG(opened_stat.st_mode):
                 return False
             if os.name != "nt" and (
-                opened_stat.st_uid != os.getuid()
+                not _is_current_posix_owner(opened_stat.st_uid)
                 or stat.S_IMODE(opened_stat.st_mode) != 0o600
                 or marker_stat.st_dev != opened_stat.st_dev
                 or marker_stat.st_ino != opened_stat.st_ino
@@ -620,13 +641,8 @@ def _pid_is_alive(pid: int) -> bool:
     if type(pid) is not int or pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
+        return bool(psutil.pid_exists(pid))
+    except Exception:
         return False
 
 
@@ -641,7 +657,7 @@ def reap_owned_browser_use_orphans(*, limit: int = 64) -> int:
         try:
             marker_stat = marker.lstat()
             if os.name != "nt" and (
-                marker_stat.st_uid != os.getuid()
+                not _is_current_posix_owner(marker_stat.st_uid)
                 or stat.S_IMODE(marker_stat.st_mode) != 0o600
                 or not stat.S_ISREG(marker_stat.st_mode)
             ):

@@ -26,6 +26,7 @@ import time
 import pytest
 
 import tools.browser_use_cli as bu_cli
+from tools.native_auth_runtime import NativeAuthSecurityError
 
 
 @pytest.fixture(autouse=True)
@@ -742,6 +743,38 @@ class TestOwnTabPreamble:
 
 
 class TestOwnedBrowserUseDaemonLifecycle:
+    def test_posix_owner_check_enforces_identity_and_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(bu_cli.os, "name", "posix")
+        monkeypatch.setattr(bu_cli.os, "getuid", lambda: 4242)
+
+        assert bu_cli._is_current_posix_owner(4242) is True
+        assert bu_cli._is_current_posix_owner(4243) is False
+
+        monkeypatch.delattr(bu_cli.os, "getuid")
+        assert bu_cli._is_current_posix_owner(4242) is False
+
+    def test_runtime_layout_rejects_unowned_posix_runtime(self, tmp_path, monkeypatch):
+        runtime = tmp_path / "runtime"
+        runtime.mkdir(mode=0o700)
+        runtime.chmod(0o700)
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(runtime))
+        monkeypatch.setattr(bu_cli, "_current_posix_uid", lambda: runtime.stat().st_uid + 1)
+
+        with pytest.raises(NativeAuthSecurityError, match="secure browser channel unavailable"):
+            bu_cli._harness_runtime_layout("ha1-owner-check")
+
+    def test_pid_is_alive_uses_portable_psutil_probe(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            bu_cli.psutil,
+            "pid_exists",
+            lambda pid: calls.append(pid) or pid == 4242,
+        )
+
+        assert bu_cli._pid_is_alive(4242) is True
+        assert bu_cli._pid_is_alive(4243) is False
+        assert calls == [4242, 4243]
+
     def test_register_and_task_cleanup_are_private_and_idempotent(self, tmp_path, monkeypatch):
         runtime = tmp_path / "runtime"
         runtime.mkdir(mode=0o700)
