@@ -47,12 +47,14 @@ function routeTitle(path: string): string {
   return contributedRoutes().find(r => r.path === path)?.title ?? humanizePath(path)
 }
 
-function RouteTilePane({ path }: { path: string }) {
+export function RouteTilePane({ path }: { path: string }) {
   const builtin = BUILTIN_PAGES[path]
 
   // Subscribe so a plugin page tile appears the moment its route registers.
-  useContributions(ROUTES_AREA)
-  const contrib = builtin ? null : contributedRoutes().find(r => r.path === path)
+  // The snapshot feeds the lookup: under React Compiler an independently
+  // called contributedRoutes() can stay memoized across that registration.
+  const contributions = useContributions(ROUTES_AREA)
+  const contrib = builtin ? null : contributedRoutes(contributions).find(r => r.path === path)
 
   if (builtin) {
     return (
@@ -86,7 +88,6 @@ function RouteTilePane({ path }: { path: string }) {
 /** Keep pane contributions mirroring `$routeTiles`. Call once from the root. */
 export const watchRouteTiles = paneMirror<RouteTile>({
   source: $routeTiles,
-  workspaceMode: 'sessions',
   key: t => t.path,
   prefix: 'route-tile',
   dir: t => t.dir,

@@ -16,7 +16,7 @@ def _setup_sessions(tmp_path, sessions_data):
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     index_file = sessions_dir / "sessions.json"
-    index_file.write_text(json.dumps(sessions_data))
+    index_file.write_text(json.dumps(sessions_data), encoding="utf-8")
     return sessions_dir, index_file
 
 
@@ -119,31 +119,45 @@ class TestMirrorToSession:
         assert result is False
 
 
-    def test_direct_session_id_mirror(self):
-        with patch("gateway.mirror._append_to_sqlite", return_value=True) as mock_sqlite:
-            result = mirror_to_session_id(
-                "webui-session-123",
-                "[Cron delivery: test]\nhello",
-                source_label="cron",
-                role="user",
-            )
+    def test_failed_sqlite_write_reports_false(self, tmp_path):
+        """A mirror whose transcript write raises must not report success (#10130)."""
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "dm": {
+                "session_id": "sess_dm",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+        })
+        broken_db = MagicMock()
+        broken_db.find_session_by_origin.return_value = None  # resolve via sessions.json
+        broken_db.append_message.side_effect = OSError("disk full")
 
-        assert result is True
-        mock_sqlite.assert_called_once()
-        assert mock_sqlite.call_args.args[0] == "webui-session-123"
-        assert mock_sqlite.call_args.args[1]["role"] == "user"
-        assert "hello" in mock_sqlite.call_args.args[1]["content"]
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("hermes_state_registry.acquire", return_value=broken_db), \
+             patch("hermes_state_registry.release_or_close"):
+            result = mirror_to_session("telegram", "123", "Hello!")
+
+        assert result is False
+        broken_db.append_message.assert_called_once()
 
 
 class TestAppendToSqlite:
-    def test_connection_is_closed_after_use(self, tmp_path):
-        """Verify _append_to_sqlite closes the SessionDB connection."""
+    def test_connection_is_released_after_use(self, tmp_path):
+        """Verify _append_to_sqlite returns the shared SessionDB reference."""
         from gateway.mirror import _append_to_sqlite
         mock_db = MagicMock()
+        released = []
 
-        with patch("hermes_state.SessionDB", return_value=mock_db):
+        with patch("hermes_state_registry.acquire", return_value=mock_db), \
+             patch(
+                 "hermes_state_registry.release_or_close",
+                 side_effect=lambda db: released.append(db),
+             ):
             _append_to_sqlite("sess_1", {"role": "assistant", "content": "hello"})
 
         mock_db.append_message.assert_called_once()
-        mock_db.close.assert_called_once()
+        assert released == [mock_db], (
+            "the shared handle must be released exactly once after use"
+        )
 
