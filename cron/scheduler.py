@@ -930,7 +930,7 @@ def _cron_inactivity_seconds() -> float:
     try:
         return float(raw)
     except (ValueError, TypeError):
-        logger.warning("Invalid %s=%r; using default 600s", source, raw)
+        logger.warning("Invalid HERMES_CRON_TIMEOUT=%r; using default 600s", raw)
         return 600.0
 
 

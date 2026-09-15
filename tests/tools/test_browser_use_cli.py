@@ -13,7 +13,6 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
-import shlex
 import stat
 import subprocess
 import sys
@@ -938,12 +937,6 @@ class TestSkillTextDescription:
         for helper in ("new_tab(", "page_info()", "js(", "fill_input(",
                        "click_at_xy(", "capture_screenshot()", "cdp("):
             assert helper in bu_cli._HELPERS_DIGEST
-
-    def test_digest_routes_auth_walls_to_native_component_request(self):
-        assert "<semreh.native-component>" in bu_cli._HELPERS_DIGEST
-        assert "website_login" not in bu_cli._HELPERS_DIGEST
-        assert "never" in bu_cli._HELPERS_DIGEST.lower()
-        assert "credential" in bu_cli._HELPERS_DIGEST.lower()
 
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]

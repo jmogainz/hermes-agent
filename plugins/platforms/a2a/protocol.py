@@ -7,16 +7,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import base64
-import mimetypes
 import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int

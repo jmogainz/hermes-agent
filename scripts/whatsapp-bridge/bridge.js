@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Goku WhatsApp Bridge
+ * Hermes Agent WhatsApp Bridge
  *
  * Standalone Node.js process that connects to WhatsApp via Baileys
  * and exposes HTTP endpoints for the Python gateway adapter.
@@ -19,12 +19,12 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser, Browsers } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -89,7 +89,6 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
-const QR_FILE = getArg('qr-file', process.env.WHATSAPP_QR_FILE || '');
 // Cache directories: the Python gateway passes the profile-aware paths via
 // env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
 // hardcoded locations for bridges launched outside the gateway.
@@ -99,7 +98,13 @@ const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
-let SCRIPT_HASH = 'unknown';
+
+// Self-hash of this script file.  Reported in /health so the Python gateway
+// can detect a running bridge that predates the current bridge.js and
+// restart it instead of silently reusing stale code (stale-bridge trap:
+// `hermes update` updates bridge.js on disk but a long-lived bridge process
+// keeps serving the old behavior forever).
+let SCRIPT_HASH = '';
 try {
   SCRIPT_HASH = createHash('sha256')
     .update(readFileSync(fileURLToPath(import.meta.url)))
@@ -108,7 +113,6 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
-const PAIR_PHONE = getArg('pair-phone', process.env.WHATSAPP_PAIR_PHONE || '').replace(/\D/g, '');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -363,7 +367,6 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
-let pairingCodeRequested = false;
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
@@ -373,13 +376,7 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(async () => {
-  try {
-    return await fetchLatestWaWebVersion();
-  } catch {
-    return await fetchLatestBaileysVersion();
-  }
-});
+const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -390,11 +387,9 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    // Real browser fingerprint — custom ['Goku','Chrome',...] is associated with WA 405 rejections
-    browser: Browsers.macOS('Chrome'),
+    browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    connectTimeoutMs: 60_000,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
@@ -409,10 +404,7 @@ async function startSocket() {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr && !PAIR_PHONE) {
-      if (QR_FILE) {
-        writeFileSync(QR_FILE, qr);
-      }
+    if (qr) {
       if (PAIR_JSON) {
         emitPairEvent({ event: 'qr', qr });
       } else {
@@ -465,20 +457,6 @@ async function startSocket() {
       }
     }
   });
-
-  if (PAIR_ONLY && PAIR_PHONE && !state.creds.registered && !pairingCodeRequested) {
-    pairingCodeRequested = true;
-    setTimeout(async () => {
-      try {
-        const code = await sock.requestPairingCode(PAIR_PHONE);
-        console.log(`\n🔢 WhatsApp pairing code for ${PAIR_PHONE}: ${code}\n`);
-        console.log('On your phone: WhatsApp → Settings → Linked Devices → Link with phone number instead');
-        console.log('Enter the code above when prompted.\n');
-      } catch (err) {
-        console.error(`❌ Failed to request pairing code: ${err?.message || err}`);
-      }
-    }, 3000);
-  }
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
@@ -904,7 +882,6 @@ app.post('/edit', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {

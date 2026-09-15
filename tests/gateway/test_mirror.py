@@ -6,7 +6,6 @@ from unittest.mock import patch, MagicMock
 import gateway.mirror as mirror_mod
 from gateway.mirror import (
     mirror_to_session,
-    mirror_to_session_id,
     _find_session_id,
 )
 

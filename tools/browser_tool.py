@@ -464,7 +464,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content. If the snapshot shows a sign-in, passkey, MFA, SSO, or OIDC wall, stop browser credential actions. Use the sanitized `auth_context` from the latest browser result to emit exactly one bounded `<semreh.native-component>` marker with its `context_id`, then wait for opaque native-component state; never put credentials, OTPs, cookies, or form values in browser tool calls.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -493,7 +493,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type non-secret text into an input field identified by its ref ID. Clears the field first, then types the new text. Never type passwords, passcodes, OTPs, passkeys, API keys, cookies, tokens, or other credentials. If the field is part of a sign-in, MFA, SSO, or OIDC flow, stop and emit the bounded `<semreh.native-component>` marker from the browser's sanitized `auth_context`; do not use a legacy login tool. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -724,9 +724,6 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return json.dumps(safety_error)
 
     effective_task_id = task_id or "default"
-    native_blocked = _native_auth_mutation_guard(effective_task_id, "navigation")
-    if native_blocked is not None:
-        return native_blocked
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
@@ -937,30 +934,6 @@ def _blocked_private_page(effective_task_id: str, why: str) -> Optional[str]:
         return None
     blocked_url = _eval_policy._current_page_private_url(effective_task_id)
     return _blocked_private_page_json(blocked_url, why) if blocked_url else None
-
-
-def _native_auth_mutation_guard(effective_task_id: str, action: str) -> Optional[str]:
-    """Return an opaque block when model browser mutation must pause for auth."""
-    try:
-        from tools.native_auth_runtime import native_auth_runtime
-
-        blocked = native_auth_runtime.model_browser_mutation_guard(
-            effective_task_id,
-            action=action,
-        )
-    except Exception:
-        logger.exception("native auth mutation guard unavailable")
-        blocked = "auth_boundary_required: native authentication guard unavailable"
-    if not blocked:
-        return None
-    return json.dumps(
-        {
-            "success": False,
-            "error": blocked,
-            "auth_boundary_required": True,
-        },
-        ensure_ascii=False,
-    )
 
 
 def _blocked_private_page_action(effective_task_id: str, action: str) -> Optional[str]:

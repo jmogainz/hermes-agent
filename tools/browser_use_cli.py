@@ -608,49 +608,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
-    if not _internal_native_auth:
-        try:
-            from tools.native_auth_runtime import native_auth_runtime
-
-            guard = native_auth_runtime.model_code_guard(
-                task_id or session or "default",
-                code,
-            )
-            if guard:
-                return tool_error(guard)
-        except Exception:
-            logger.debug("native auth model-code guard failed", exc_info=True)
-            return tool_error(
-                "Native auth browser guard is unavailable; refusing to execute "
-                "browser code until the auth boundary is healthy."
-            )
-
     blocked = _blocked_url_in_code(code)
     if blocked:
         return tool_error(blocked)
-    model_code = code
-
-    if task_id and not _internal_native_auth and not _disable_native_auth_probe:
-        probe_ok, auth_context, probe_result = _run_privileged_native_auth_probe(
-            session=session,
-            task_id=task_id,
-            timeout_s=timeout_s,
-            local=local,
-        )
-        if auth_context is not None:
-            return tool_result({
-                "success": True,
-                "exit_code": 0,
-                "output": "",
-                "auth_boundary_required": True,
-                "auth_context": auth_context,
-                "session": session,
-            })
-        if not probe_ok and _browser_code_requires_interaction(code):
-            return tool_error(
-                "Native auth browser probe is unavailable; refusing to execute "
-                "browser interaction code until the exact active page can be verified."
-            )
 
     cmd = _find_cli()
     if not cmd:
