@@ -3105,7 +3105,29 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
         if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
-        # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
+        # Preserve the richer chronological digest used by the gateway regression path. The current
+        # upstream fallback keeps compact anchors; this bounded section retains exact recent user/tool
+        # activity when the auxiliary summary call fails, without replacing upstream's format.
+        try:
+            digest = self._generate_static_fallback_summary(
+                turns_to_summarize,
+                n_dropped=len(turns_to_summarize),
+            )
+            marker = "Deterministic compacted-turn digest:"
+            marker_idx = digest.find(marker)
+            if marker_idx >= 0:
+                digest_section = digest[marker_idx:marker_idx + 8_000].rstrip()
+                summary = summary + "\n\n" + digest_section
+        except Exception:
+            logger.debug("Could not append detailed deterministic fallback digest", exc_info=True)
+        # The generic secret redactor preserves recognizable token prefixes for diagnostics. Compaction
+        # output is durable model context, so remove those prefixes too before re-injecting it.
+        summary = re.sub(
+            r"\b(?:ghp|github_pat|gho|ghu|ghs|ghr)_[A-Za-z0-9._-]+\b",
+            "[REDACTED]",
+            summary,
+            flags=re.IGNORECASE,
+        )
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
         return self._augment_summary_lean(summary, turns_to_summarize)
 
@@ -3533,7 +3555,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         self._last_summary_error = err_text
         # Terminal network/empty-content failure after any fallback: flag so compress() ABORTS
         # and preserves the session; independent of abort_on_summary_failure.
-        if kind.streaming_closed:
+        if kind.streaming_closed and not kind.timeout:
             # A terminal connection/network failure or empty-content response from a degraded provider (we
             # reach this branch only after any main-model fallback has already been tried or is
             # unavailable). Flag it so compress() ABORTS and preserves the session unchanged instead of
@@ -4629,13 +4651,27 @@ Deterministic compacted-turn digest:
         self._last_summary_dropped_count = n_dropped
         self._last_summary_fallback_used = True
         telemetry["fallback_used"] = True
+        # A timeout is recoverable after the bounded retry. Use the richer digest directly so the
+        # timeout path never presents the older opaque "summary unavailable" marker.
+        _summary_error = str(self._last_summary_error or "").lower()
+        if (
+            not feasibility_skip
+            and "timeout" in _summary_error
+            and "responses stream" in _summary_error
+        ):
+            telemetry["failure_class"] = telemetry.get("failure_class") or "summary_generation_timeout"
+            summary = self._generate_static_fallback_summary(
+                turns_to_summarize,
+                n_dropped=n_dropped,
+            )
+            self._previous_summary = self._strip_summary_prefix(summary)
+            return summary
         # Feasibility skip is deliberate, not aux-model breakage — keep the telemetry class distinct.
         telemetry["failure_class"] = telemetry.get("failure_class") or (
             "feasibility_skip" if feasibility_skip else "summary_generation_failed"
         )
         return self._build_static_fallback_summary(
             turns_to_summarize,
-            # A stale error from an earlier failure must not be embedded in a feasibility-skip fallback.
             reason=None if feasibility_skip else self._last_summary_error,
         )
 
