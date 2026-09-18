@@ -165,14 +165,18 @@ def _execute_decision(
             return False, result, False
         return True, result, False
     if action == "type":
+        target = decision.get("target_element")
+        if target is None:
+            return False, {"error": "type missing target_element"}, False
         if decision.get("needs_generation") and not (text or "").strip():
             return False, {"error": "needs_generation — planner must supply text"}, False
         if not (text or "").strip():
             return False, {"error": "type requires text"}, False
-        args = {"text": text}
+        # TYPE(target, text) compiles to set_value so the chosen element is the one written.
+        args = {"element": int(target), "value": text}
         if app:
             args["app"] = app
-        result = _dispatch_action(handle, action, args)
+        result = _dispatch_action(handle, "set_value", args)
         if result.get("error"):
             return False, result, False
         return True, result, False
@@ -414,6 +418,22 @@ def run_decide_loop(
             return LoopResult(
                 ok=False,
                 status="error",
+                steps=steps,
+                elapsed_s=round(time.perf_counter() - started, 3),
+                goal=goal,
+                max_steps=max_steps,
+                cache_hit_steps=cache_hit_steps,
+            )
+
+        # An action whose own verdict says the input did not land (suspected_noop / refusal)
+        # hands back to the planner instead of stepping again on unverified state.
+        verdict_decision = (exec_payload.get("verdict") or {}).get("decision") if isinstance(exec_payload, dict) else None
+        if verdict_decision == "escalate":
+            loop_step.fail_open = True
+            loop_step.elapsed_s = round(time.perf_counter() - step_started, 3)
+            return LoopResult(
+                ok=False,
+                status="fail_open",
                 steps=steps,
                 elapsed_s=round(time.perf_counter() - started, 3),
                 goal=goal,

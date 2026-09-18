@@ -67,7 +67,8 @@ def _canon_key_combo(keys: str) -> frozenset:
 
 def _reject_unsafe(action: str, args: Dict[str, Any]) -> Optional[str]:
     """JSON error for hard-blocked input, else None. Runs BEFORE the approval prompt."""
-    if action == "type" and (pat := next((p.pattern for p in _BLOCKED_TYPE_PATTERNS if p.search(args.get("text", ""))), None)):
+    blob = args.get("text", "") if action == "type" else args.get("value", "") if action == "set_value" else ""
+    if action in {"type", "set_value"} and (pat := next((p.pattern for p in _BLOCKED_TYPE_PATTERNS if p.search(blob)), None)):
         return json.dumps({"error": f"blocked pattern in type text: {pat!r}",
                            "hint": "Dangerous shell patterns cannot be typed via computer_use."})
     if action == "key" and (blocked := next((b for b in _BLOCKED_KEY_COMBOS
@@ -339,11 +340,22 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     list_apps, list_windows = _noop_stub("list_apps", result=[]), _noop_stub("list_windows", result=[])
     focus_app = _noop_stub("focus_app", "app", "raise_window")
 
+def _authorize(action: str, args: Dict[str, Any]) -> Optional[str]:
+    """Hard-block then per-action approval. Same gates as a standalone computer_use call."""
+    if (err := _reject_unsafe(action, args)) is not None:
+        return err
+    spec = _ACTIONS.get(action)
+    scopes = ([action] if spec is not None and spec.destructive else []) + (
+        ["bring_to_front"] if args.get("bring_to_front") or (action == "focus_app" and args.get("raise_window")) else [])
+    for scope in scopes:
+        if (err := _request_approval(scope, args)) is not None:
+            return err
+    return None
+
 # ── Dispatch ────────────────────────────────────────────────────────────────
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point (tools.registry): a JSON string (text-only) or a dict marked `_multimodal`. Order: hard
-    blocks (_reject_unsafe) -> approval scopes (destructive action, then 'bring_to_front' — persistent focus is a
-    separate visible side effect with its own scope) -> backend -> dispatch under the session call lock."""
+    blocks + approval scopes (`_authorize`) -> backend -> dispatch under the session call lock."""
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
@@ -356,14 +368,9 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
 
 def _handle_computer_use(args: Dict[str, Any], kwargs: Dict[str, Any], action: str, session_id: str) -> Any:
-    if (err := _reject_unsafe(action, args)) is not None:
-        return err
     with phase("approval_wait"):
-        scopes = ([action] if action in _ACTIONS and _ACTIONS[action].destructive else []) + (
-            ["bring_to_front"] if args.get("bring_to_front") or (action == "focus_app" and args.get("raise_window")) else [])
-        for scope in scopes:
-            if (err := _request_approval(scope, args)) is not None:
-                return err
+        if (err := _authorize(action, args)) is not None:
+            return err
     with phase("backend_resolve"):
         try:
             backend = _get_backend(session_id=session_id)
@@ -464,10 +471,7 @@ def _guarded_capture(backend, session_id: Optional[str], **capture_kwargs) -> An
 def _do_capture(backend, action, args, session_id=None, **_):
     if (mode := str(args.get("mode", "som"))) not in {"som", "vision", "ax"}:
         return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
-    if args.get("url") and hasattr(backend, "navigate"):
-        nav = backend.navigate(str(args["url"]))
-        if not nav.ok:
-            return json.dumps({"error": nav.message or "navigate failed"})
+    # Captures are observational: navigation is the separate, approval-gated `navigate` action.
     # pid/window_id forwarded only when given so older backends keep their defaults.
     return _guarded_capture(backend, session_id, mode=mode, app=args.get("app"),
                             **{k: args[k] for k in ("pid", "window_id") if args.get(k) is not None})
@@ -557,40 +561,24 @@ def _do_decide(backend, action, args, session_id=None, **_):
 
 
 def _do_run_goal(backend, action, args, session_id=None, **_):
-    """Bounded decide→act loop. Fail-open to the planner; no frontier model in the loop."""
+    """Decide→act loop. Inner nodes use the same authorization path as standalone actions."""
     goal = (args.get("goal") or args.get("goal_hint") or "").strip()
     if not goal:
         return json.dumps({"error": "run_goal requires `goal`"})
+    if args.get("url"):
+        nav = execute_authorized_action(
+            backend, "navigate", {"action": "navigate", "url": str(args["url"])},
+            session_id=session_id)
+        parsed = nav if isinstance(nav, dict) else json.loads(nav) if isinstance(nav, str) else {"ok": False}
+        if not parsed.get("ok"):
+            return json.dumps({"error": parsed.get("error") or parsed.get("message") or "navigate failed"})
     from tools.computer_use.decide_loop import run_decide_loop
 
     def handle(inner: Dict[str, Any]) -> Any:
-        act = inner.get("action")
-        if act == "decide":
-            return _do_decide(backend, "decide", inner, session_id=session_id)
-        if act == "capture":
-            return _do_capture(backend, "capture", inner, session_id=session_id)
-        if act == "type":
-            blocked = _reject_unsafe("type", inner)
-            if blocked is not None:
-                return blocked
-            res = backend.type_text(inner.get("text", ""))
-            return {"ok": res.ok, "error": None if res.ok else res.message}
-        if act == "key":
-            blocked = _reject_unsafe("key", inner)
-            if blocked is not None:
-                return blocked
-            res = backend.key(inner.get("keys", ""))
-            return {"ok": res.ok, "error": None if res.ok else res.message}
-        if act == "click":
-            res = backend.click(element=inner.get("element"))
-            return {"ok": res.ok, "error": None if res.ok else res.message}
-        if act == "scroll":
-            res = backend.scroll(direction=inner.get("direction", "down"))
-            return {"ok": res.ok, "error": None if res.ok else res.message}
-        if act == "wait":
-            res = backend.wait(float(inner.get("seconds", 0.3)))
-            return {"ok": res.ok, "error": None if res.ok else res.message}
-        return {"ok": False, "error": f"unsupported loop action {act!r}"}
+        # Same gates as a standalone call: hard-block + per-action approval + dispatch
+        # (sticky-target guard included) — run_goal is orchestration, not an authorization bypass.
+        return execute_authorized_action(
+            backend, inner.get("action"), inner, session_id=session_id)
 
     result = run_decide_loop(
         goal,
@@ -655,8 +643,8 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         backend, args, session_id=delivery.get("session_id"))),
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),
     "list_windows": _ActionSpec(partial(_do_listing, key="windows")),
-    "decide": _ActionSpec(_do_decide),
-    "run_goal": _ActionSpec(_do_run_goal),
+    "decide": _ActionSpec(_do_decide, summarize=lambda a, args, fg: f"decide {args.get('goal', '')[:80]!r}{fg}"),
+    "run_goal": _ActionSpec(_do_run_goal, summarize=lambda a, args, fg: f"run_goal {args.get('goal', '')[:80]!r}{fg}"),
 }
 # Native input actions deliver to the backend's sticky target; `app=` is NOT a targeting parameter (guard in _dispatch).
 _INPUT_ACTIONS = frozenset(a for a, s in _ACTIONS.items() if s.input)
@@ -698,6 +686,17 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any], se
                            bring_to_front=bool(args.get("bring_to_front")), **({} if spec.input else {"session_id": session_id}))
     return res if isinstance(res, (str, dict)) else _maybe_follow_capture(backend, res, bool(args.get("capture_after")),
                                                                          session_id=session_id)
+
+def execute_authorized_action(
+    backend: ComputerUseBackend, action: Any, args: Dict[str, Any], session_id: Optional[str] = None,
+) -> Any:
+    """Authorize then dispatch. Shared by standalone computer_use and run_goal inner nodes."""
+    action = (action or "").strip().lower()
+    if not action:
+        return json.dumps({"error": "missing `action`"})
+    if (err := _authorize(action, args)) is not None:
+        return err
+    return _dispatch(backend, action, args, session_id=session_id)
 
 # ── Response shaping ────────────────────────────────────────────────────────
 def _classify_action_result(res: ActionResult) -> Dict[str, Any]:
