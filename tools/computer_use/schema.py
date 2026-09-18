@@ -35,6 +35,7 @@ _PROPERTIES: Dict[str, Any] = {
             "decide",
             "run_goal",
             "navigate",
+            "sequence",
         ],
         "description": (
             "Which action to perform. For a multi-step desktop or browser goal, prefer `run_goal` "
@@ -193,6 +194,31 @@ _PROPERTIES: Dict[str, Any] = {
             "cua-driver's standalone bring_to_front tool before the input; it is never passed as "
             "an input property. This persistent focus change has a separate approval scope. "
             "Default false."
+        ),
+    },
+    "steps": {
+        "type": "array",
+        "items": {"type": "object"},
+        "description": (
+            "Only for action='sequence': the ordered action slice to run from this one decision. Each "
+            "step is an object with `action` (click|double_click|right_click|middle_click|drag|scroll|"
+            "type|key|set_value|wait|focus_app) plus that action's usual parameters. V1 rules: at most "
+            "ONE step may be grounded on an element index/coordinate from the last capture — later "
+            "steps must be focus/keyboard/text/wait operations that need no new visual grounding. The "
+            "slice stops at the first failure, suspected no-op, approval denial, lost target, or "
+            "timeout; per-step `capture_after` is not allowed — the slice does one final capture. Every "
+            "step re-runs the normal safety and approval path; sequence is orchestration, not an "
+            "authorization bypass."
+        ),
+    },
+    "verify_mode": {
+        "type": "string",
+        "enum": ["ax_first", "som", "vision"],
+        "description": (
+            "Only for action='sequence' with capture_after=true: how the one final verification "
+            "capture is taken. `ax_first` (default) reads the accessibility tree and falls back to a "
+            "screenshot only when the tree is empty. `som`/`vision` force that mode. Does not change "
+            "the global capture_after_mode."
         ),
     },
     "capture_after": {
