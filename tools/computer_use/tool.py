@@ -161,6 +161,10 @@ def _new_backend(permission_mode: str) -> ComputerUseBackend:
     if backend_name in {"cua", "cua-driver", ""}:
         from tools.computer_use.cua_backend import CuaDriverBackend
         return CuaDriverBackend(permission_mode=permission_mode)
+    if backend_name in {"browser", "playwright"}:
+        from tools.computer_use.browser_backend import BrowserBackend
+        target = (os.environ.get("HERMES_CU_BROWSER_URL") or os.environ.get("HERMES_CU_BROWSER_HTML") or "").strip()
+        return BrowserBackend(target or "about:blank")
     if backend_name != "noop":
         raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
     return _NoopBackend()  # pragma: no cover
@@ -375,13 +379,144 @@ def _do_scroll(backend, action, args, **delivery):
 def _do_capture(backend, action, args, session_id=None, **_):
     if (mode := str(args.get("mode", "som"))) not in {"som", "vision", "ax"}:
         return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
-    # pid/window_id forwarded only when given so older backends keep their defaults.
+    if args.get("url") and hasattr(backend, "navigate"):
+        nav = backend.navigate(str(args["url"]))
+        if not nav.ok:
+            return json.dumps({"error": nav.message or "navigate failed"})
     return _capture_response(backend.capture(mode=mode, app=args.get("app"),
                                              **{k: args[k] for k in ("pid", "window_id") if args.get(k) is not None}),
                              session_id=session_id)
 
+def _do_navigate(backend, action, args, **_):
+    url = (args.get("url") or "").strip()
+    if not url:
+        return json.dumps({"error": "navigate requires `url`"})
+    if not hasattr(backend, "navigate"):
+        return json.dumps({"error": "navigate is only available on the browser backend"})
+    return _text_response(backend.navigate(url, new_tab=bool(args.get("raise_window"))))
+
+
 def _do_listing(backend, action, args, key, **_):
     return json.dumps({key: (items := getattr(backend, action)()), "count": len(items)})
+
+def _elements_to_candidates(elements):
+    from tools.computer_use.decision_lane import ElementCandidate
+    return tuple(
+        ElementCandidate(ref=str(el.index), label=el.label or "", role=el.role or "", enabled=True)
+        for el in (elements or [])
+    )
+
+def _decide_hint(decision) -> str:
+    if decision.done:
+        return "Goal appears complete on the current screen."
+    if decision.action == "escalate":
+        return "Hand back to main planner for a broader strategy."
+    if decision.needs_vision:
+        return "Use capture(mode='som') for pixel evidence before acting."
+    if decision.needs_generation:
+        return "Compose text yourself, then type via computer_use."
+    elem = f" element #{decision.target_ref}" if decision.target_ref else ""
+    return (f"Suggested next step: {decision.action}{elem} "
+            f"(backend={decision.backend}, conf={decision.confidence:.2f}).")
+
+def _do_decide(backend, action, args, session_id=None, **_):
+    """System-One lane: rules → reranker → Jev. Fail-open to the planner."""
+    goal = (args.get("goal") or args.get("goal_hint") or "").strip()
+    if not goal:
+        return json.dumps({"error": "decide requires `goal`"})
+    from tools.computer_use.decision_lane import jev_available, run_decision_lane, SemanticState
+    from tools.computer_use.decision_stages import jev_stage, reranker_stage
+    cap = backend.capture(mode="ax", app=args.get("app"),
+                          **{k: args[k] for k in ("pid", "window_id") if args.get(k) is not None})
+    candidates = _elements_to_candidates(cap.elements)
+    state = SemanticState(elements=candidates, busy=bool(args.get("busy")), goal_hint=goal)
+    decision, packet = run_decision_lane(
+        state, candidates, reranker=reranker_stage, jev=jev_stage,
+    )
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "action": "decide",
+        "fail_open": decision is None,
+        "jev_available": jev_available(),
+        "decision_packet": packet.to_dict(),
+        "app": cap.app,
+        "window_title": cap.window_title,
+        "element_count": len(candidates),
+    }
+    if decision is not None:
+        target_element = int(decision.target_ref) if decision.target_ref and str(decision.target_ref).isdigit() else None
+        payload["decision"] = {
+            "action": decision.action,
+            "target_ref": decision.target_ref,
+            "target_element": target_element,
+            "needs_vision": decision.needs_vision,
+            "needs_generation": decision.needs_generation,
+            "done": decision.done,
+            "confidence": decision.confidence,
+            "backend": decision.backend,
+        }
+        payload["verdict"] = {"decision": "done" if decision.done else "suggest_action", "hint": _decide_hint(decision)}
+    else:
+        payload["verdict"] = {
+            "decision": "escalate",
+            "hint": "Decision lane abstained — plan the next step with capture + your usual reasoning.",
+        }
+    return json.dumps(payload)
+
+
+
+def _do_run_goal(backend, action, args, session_id=None, **_):
+    """Decide→act loop. Fail-open to the planner; no frontier model in the loop."""
+    goal = (args.get("goal") or args.get("goal_hint") or "").strip()
+    if not goal:
+        return json.dumps({"error": "run_goal requires `goal`"})
+    if args.get("url") and hasattr(backend, "navigate"):
+        nav = backend.navigate(str(args["url"]))
+        if not nav.ok:
+            return json.dumps({"error": nav.message or "navigate failed"})
+    from tools.computer_use.decide_loop import run_decide_loop
+
+    def handle(inner: Dict[str, Any]) -> Any:
+        act = inner.get("action")
+        if act == "decide":
+            return _do_decide(backend, "decide", inner, session_id=session_id)
+        if act == "type":
+            blocked = _reject_unsafe("type", inner)
+            if blocked is not None:
+                return blocked
+            res = backend.type_text(inner.get("text", ""))
+            return {"ok": res.ok, "error": None if res.ok else res.message}
+        if act == "key":
+            blocked = _reject_unsafe("key", inner)
+            if blocked is not None:
+                return blocked
+            res = backend.key(inner.get("keys", ""))
+            return {"ok": res.ok, "error": None if res.ok else res.message}
+        if act == "click":
+            res = backend.click(element=inner.get("element"))
+            return {"ok": res.ok, "error": None if res.ok else res.message}
+        if act == "scroll":
+            res = backend.scroll(direction=inner.get("direction", "down"))
+            return {"ok": res.ok, "error": None if res.ok else res.message}
+        if act == "wait":
+            res = backend.wait(float(inner.get("seconds", 0.3)))
+            return {"ok": res.ok, "error": None if res.ok else res.message}
+        return {"ok": False, "error": f"unsupported loop action {act!r}"}
+
+    result = run_decide_loop(
+        goal, handle, app=args.get("app"),
+        max_steps=int(args.get("max_steps") or 8),
+        text=args.get("text"),
+    )
+    payload = result.to_dict()
+    payload["action"] = "run_goal"
+    payload["verdict"] = {
+        "decision": "done" if result.ok else "escalate",
+        "hint": "Goal completed without a frontier-model round trip." if result.ok
+        else "Decision lane fail-opened — continue with capture + planner.",
+    }
+    return json.dumps(payload)
+
 
 def _summarize_click(action: str, args: Dict[str, Any], fg: str) -> str:
     where = (f" element #{args['element']}" if args.get("element") is not None
@@ -415,6 +550,15 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
     "capture": _ActionSpec(_do_capture),
+    "navigate": _ActionSpec(
+        _do_navigate, destructive=True,
+        summarize=lambda a, args, fg: f"navigate {args.get('url', '')[:80]!r}{fg}",
+    ),
+    "decide": _ActionSpec(_do_decide, summarize=lambda a, args, fg: f"decide {args.get('goal', '')[:80]!r}{fg}"),
+    "run_goal": _ActionSpec(
+        _do_run_goal, destructive=True,
+        summarize=lambda a, args, fg: f"run_goal {args.get('goal', '')[:80]!r}{fg}",
+    ),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),
     "list_windows": _ActionSpec(partial(_do_listing, key="windows")),
