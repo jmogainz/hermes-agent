@@ -23,6 +23,12 @@ from tools.computer_use.system_one import (
     classify_http_status,
 )
 
+# OpenRouter's decisions route serves the same Jev model over a different transport
+# (no waitlist; same $0.042/M input pricing). A direct TypeSafe key wins when present.
+OPENROUTER_BASE_URL = "https://openrouter.ai"
+OPENROUTER_ENDPOINT = "/api/alpha/decisions"
+OPENROUTER_DEFAULT_MODEL = "~typesafe/jev-latest"
+
 _ACTION_CRITERIA = {
     "click": "Click or press a button, link, or control",
     "type": "Type into a text field (caller supplies text separately)",
@@ -96,8 +102,14 @@ def reranker_stage(state: SemanticState, candidates: tuple[ElementCandidate, ...
     )
 
 
+def _direct_transport() -> bool:
+    """Direct TypeSafe wins when its key is configured; OpenRouter otherwise."""
+    return any(os.environ.get(name, "").strip() for name in ("TYPESAFE_API_KEY", "JEV_API_KEY"))
+
+
 def _jev_api_key() -> str:
-    for name in ("TYPESAFE_API_KEY", "JEV_API_KEY"):
+    """Credential for the active transport: direct TypeSafe, else OpenRouter."""
+    for name in ("TYPESAFE_API_KEY", "JEV_API_KEY", "OPENROUTER_API_KEY"):
         if val := os.environ.get(name, "").strip():
             return val
     return ""
@@ -111,15 +123,22 @@ def _jev_base_url() -> str:
 
 
 def _jev_model() -> str:
-    return os.environ.get("TYPESAFE_MODEL", os.environ.get("JEV_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    """Model name for the active transport; OpenRouter's alias differs from `jev-latest`."""
+    if _direct_transport():
+        return os.environ.get("TYPESAFE_MODEL", os.environ.get("JEV_MODEL", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    return os.environ.get("OPENROUTER_JEV_MODEL", "").strip() or OPENROUTER_DEFAULT_MODEL
 
 
 def http_transport(payload: dict[str, Any]) -> dict[str, Any]:
-    """POST to TypeSafe System One. Raises TransportError on failure."""
+    """POST to the configured Jev provider (direct TypeSafe or OpenRouter). Raises TransportError."""
     api_key = _jev_api_key()
     if not api_key:
-        raise TransportError("missing TYPESAFE_API_KEY / JEV_API_KEY")
-    url = f"{_jev_base_url()}{ENDPOINT}"
+        raise TransportError("missing TYPESAFE_API_KEY / JEV_API_KEY / OPENROUTER_API_KEY")
+    if _direct_transport():
+        url = f"{_jev_base_url()}{ENDPOINT}"
+    else:
+        base = os.environ.get("OPENROUTER_BASE_URL", "").strip().rstrip("/") or OPENROUTER_BASE_URL
+        url = f"{base}{OPENROUTER_ENDPOINT}"
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,

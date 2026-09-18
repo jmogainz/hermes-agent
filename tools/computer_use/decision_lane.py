@@ -94,8 +94,11 @@ def rules_stage(state: SemanticState, candidates: tuple[ElementCandidate, ...]) 
 
 
 def jev_available() -> bool:
-    """True when a Jev call could be attempted (key present)."""
-    return any(os.environ.get(name, "").strip() for name in ("TYPESAFE_API_KEY", "JEV_API_KEY"))
+    """True when a Jev call could be attempted (direct key or OpenRouter present)."""
+    return any(
+        os.environ.get(name, "").strip()
+        for name in ("TYPESAFE_API_KEY", "JEV_API_KEY", "OPENROUTER_API_KEY")
+    )
 
 
 def run_decision_lane(
